@@ -1,0 +1,81 @@
+[tool.black]
+# Black configuration для Confluence RAG project
+
+line-length = 120
+target-version = ['py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+    \.git
+  | \.venv
+  | venv
+  | build
+  | dist
+  | archive
+  | chroma_data
+  | htmlcov
+  | __pycache__
+)/
+'''
+
+[tool.isort]
+# isort configuration для Confluence RAG project
+
+profile = "black"
+line_length = 120
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+skip_glob = [
+    "archive/*",
+    "chroma_data/*",
+    "htmlcov/*",
+    ".venv/*",
+    "venv/*",
+    "build/*",
+    "dist/*",
+    "__pycache__/*"
+]
+
+[tool.pytest.ini_options]
+# Pytest configuration (дублирует pytest.ini для совместимости)
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "--disable-warnings",
+    "--cov=rag_server",
+    "--cov-report=html",
+    "--cov-report=term-missing",
+    "--cov-fail-under=70"
+]
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+    "slow: Slow running tests",
+    "requires_network: Tests that require network access"
+]
+
+[tool.coverage.run]
+source = ["rag_server"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "*/__pycache__/*",
+    "*/site-packages/*"
+]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
+
+[tool.coverage.html]
+directory = "htmlcov"
+

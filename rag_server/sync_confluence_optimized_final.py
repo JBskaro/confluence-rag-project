@@ -1,0 +1,1346 @@
+"""
+Сервис синхронизации Confluence в ChromaDB.
+Выполняет инкрементальную синхронизацию документов с умным chunking.
+"""
+import os
+import sys
+import json
+import time
+import logging
+import re
+from typing import List, Dict, Any, Optional
+
+import html2text
+import requests
+import chromadb
+import urllib3
+from atlassian import Confluence
+from llama_index.core import Document, VectorStoreIndex, StorageContext
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from tenacity import retry, stop_after_attempt, wait_exponential
+from bs4 import BeautifulSoup, NavigableString
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Настройка логирования из ENV
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO), 
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Отключаем избыточное логирование HTTP запросов от httpx/openai
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+
+CONFLUENCE_URL = os.getenv("CONFLUENCE_URL")
+CONFLUENCE_TOKEN = os.getenv("CONFLUENCE_TOKEN")
+
+if not CONFLUENCE_URL or not CONFLUENCE_TOKEN:
+    logger.error("CONFLUENCE_URL and CONFLUENCE_TOKEN required")
+    sys.exit(1)
+
+def get_int_env(name: str, default: int) -> int:
+    """Безопасное получение integer ENV переменной с валидацией."""
+    try:
+        value = int(os.getenv(name, str(default)))
+        if value <= 0:
+            logger.warning(f"{name}={value} некорректно, использую default={default}")
+            return default
+        return value
+    except (ValueError, TypeError):
+        logger.warning(f"{name} невалидно, использую default={default}")
+        return default
+
+CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_data")
+STATE_FILE = os.getenv("STATE_FILE", "./data/sync_state.json")
+USE_OLLAMA = os.getenv("USE_OLLAMA", "false").lower() == "true"
+# Импортируем унифицированный модуль embeddings
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+from embeddings import get_embed_model, EMBED_MODEL, USE_OLLAMA, OLLAMA_URL
+MAX_SPACES = get_int_env("MAX_SPACES", 10)
+# Фильтр пространств: если указан CONFLUENCE_SPACES, используем его вместо MAX_SPACES
+CONFLUENCE_SPACES = os.getenv("CONFLUENCE_SPACES", "").strip()
+MAX_CHUNK_SIZE = get_int_env("MAX_CHUNK_SIZE", 500)
+MIN_TEXT_LEN = get_int_env("MIN_TEXT_LEN", 50)
+VERIFY_SSL = os.getenv("VERIFY_SSL", "true").lower() == "true"
+BATCH_SIZE = get_int_env("BATCH_SIZE", 50)
+SYNC_INTERVAL = get_int_env("SYNC_INTERVAL", 3600)
+
+def get_bool_env(name: str, default: bool = False) -> bool:
+    """Безопасное получение boolean ENV переменной."""
+    value = os.getenv(name, str(default)).lower()
+    return value in ('true', '1', 'yes', 'on')
+
+# Константы для структурной нарезки
+MAX_TABLE_SIZE = get_int_env("MAX_TABLE_SIZE", 2048)
+CHUNK_OVERLAP = get_int_env("CHUNK_OVERLAP", 100)
+
+# Тестовый режим
+TEST_MODE = get_bool_env("TEST_MODE", False)
+TEST_MAX_PAGES = get_int_env("TEST_MAX_PAGES", 10)
+
+logger.info("Starting Confluence RAG sync (optimized for large instances)")
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def get_page(confluence: Confluence, page_id: str) -> Dict[str, Any]:
+    """
+    Получение страницы из Confluence с retry логикой и расширенными метаданными.
+    
+    Args:
+        confluence: Confluence API client
+        page_id: ID страницы
+    
+    Returns:
+        Данные страницы с body, version, ancestors, labels, children
+    """
+    # Расширенный запрос для получения всех метаданных
+    return confluence.get_page_by_id(
+        page_id, 
+        expand='body.storage,version,ancestors,metadata.labels,children.page,space'
+    )
+
+def get_timestamp(page: Dict[str, Any]) -> int:
+    """
+    Извлечение timestamp обновления страницы для инкрементальной синхронизации.
+    
+    Args:
+        page: Объект страницы Confluence
+    
+    Returns:
+        Timestamp в формате YYYYMMDD или 0 при ошибке
+    """
+    try:
+        ts = page.get('version', {}).get('when', '')
+        return int(ts[:10].replace('-', '')) if ts else 0
+    except Exception as e:
+        logger.debug(f"Ошибка парсинга timestamp: {e}")
+        return 0
+
+def get_page_attachments(confluence: Confluence, page_id: str) -> List[str]:
+    """
+    Получение списка вложений страницы.
+    
+    Args:
+        confluence: Confluence API client
+        page_id: ID страницы
+    
+    Returns:
+        Список имён файлов вложений
+    """
+    try:
+        url = f"{confluence.url}/rest/api/content/{page_id}/child/attachment"
+        response = requests.get(url, headers=confluence.default_headers, verify=VERIFY_SSL)
+        response.raise_for_status()
+        data = response.json()
+        attachments = data.get('results', [])
+        return [att.get('title', '') for att in attachments if att.get('title')]
+    except Exception as e:
+        logger.debug(f"Ошибка получения attachments для {page_id}: {e}")
+        return []
+
+def extract_page_metadata(page_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Извлечение расширенных метаданных из Confluence страницы с защитой от ошибок.
+    
+    Args:
+        page_data: Полные данные страницы из API
+    
+    Returns:
+        Словарь с метаданными (всегда возвращает все ключи)
+    """
+    metadata = {
+        'labels': [],
+        'parent_id': '',
+        'parent_title': '',
+        'page_path': '',  # НОВОЕ: полный путь страницы
+        'version': 1,
+        'created_by': '',
+        'modified_date': '',
+        'has_children': False,
+        'children_count': 0,
+        'attachments': []
+    }
+    
+    if not page_data or not isinstance(page_data, dict):
+        logger.debug("Invalid page_data structure")
+        return metadata
+    
+    # Labels (метки)
+    try:
+        labels_data = page_data.get('metadata', {}).get('labels', {})
+        if isinstance(labels_data, dict):
+            labels = labels_data.get('results', [])
+        elif isinstance(labels_data, list):
+            labels = labels_data
+        else:
+            labels = []
+        metadata['labels'] = [
+            label.get('name', '') for label in labels 
+            if isinstance(label, dict) and label.get('name')
+        ]
+    except Exception as e:
+        logger.debug(f"Error extracting labels: {e}")
+    
+    # Parent page (родительская страница)
+    try:
+        ancestors = page_data.get('ancestors', [])
+        if ancestors and isinstance(ancestors, list) and len(ancestors) > 0:
+            parent = ancestors[-1]  # Ближайший родитель
+            if isinstance(parent, dict):
+                metadata['parent_id'] = str(parent.get('id', ''))
+                metadata['parent_title'] = str(parent.get('title', ''))
+    except Exception as e:
+        logger.debug(f"Error extracting parent: {e}")
+    
+    # НОВОЕ: Полный путь страницы (breadcrumb path)
+    # Формат: "Parent 1 > Parent 2 > ... > Current Page"
+    # Извлекается независимо от наличия ancestors
+    try:
+        ancestors = page_data.get('ancestors', [])
+        page_path_parts = []
+        
+        # Добавляем все предков (ancestors), если они есть
+        if ancestors and isinstance(ancestors, list):
+            for ancestor in ancestors:
+                if isinstance(ancestor, dict):
+                    ancestor_title = ancestor.get('title', '')
+                    if ancestor_title:
+                        page_path_parts.append(ancestor_title)
+        
+        # Добавляем текущую страницу
+        current_title = page_data.get('title', '')
+        if current_title and current_title not in page_path_parts:
+            page_path_parts.append(current_title)
+        
+        metadata['page_path'] = ' > '.join(page_path_parts) if page_path_parts else ''
+    except Exception as e:
+        logger.debug(f"Error extracting page_path: {e}")
+        metadata['page_path'] = ''
+    
+    # Author and version info
+    try:
+        version = page_data.get('version', {})
+        if isinstance(version, dict):
+            metadata['version'] = int(version.get('number', 1))
+            by_info = version.get('by', {})
+            if isinstance(by_info, dict):
+                metadata['created_by'] = str(by_info.get('displayName', ''))
+            metadata['modified_date'] = str(version.get('when', ''))
+    except Exception as e:
+        logger.debug(f"Error extracting version info: {e}")
+    
+    # Child pages count
+    try:
+        children_data = page_data.get('children', {})
+        if isinstance(children_data, dict):
+            page_info = children_data.get('page', {})
+            if isinstance(page_info, dict):
+                children = int(page_info.get('size', 0))
+                metadata['has_children'] = children > 0
+                metadata['children_count'] = children
+    except Exception as e:
+        logger.debug(f"Error extracting children info: {e}")
+    
+    return metadata
+
+def extract_macro_body(macro_html: str) -> str:
+    """
+    Извлечение текста из тела Confluence макроса.
+    
+    Args:
+        macro_html: HTML макроса
+    
+    Returns:
+        Текст из rich-text-body макроса
+    """
+    # Извлекаем содержимое <ac:rich-text-body>...</ac:rich-text-body>
+    body_match = re.search(r'<ac:rich-text-body>(.*?)</ac:rich-text-body>', macro_html, re.DOTALL)
+    if body_match:
+        return body_match.group(1)
+    return macro_html
+
+def preprocess_confluence_macros(html: str) -> str:
+    """
+    Предобработка Confluence макросов для лучшей конвертации в текст.
+    
+    Args:
+        html: HTML с Confluence макросами
+    
+    Returns:
+        HTML с обработанными макросами
+    """
+    
+    # Info макрос: <ac:structured-macro ac:name="info">
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="info"[^>]*>(.*?)</ac:structured-macro>',
+        lambda m: f'\n\n💡 **INFO:** {extract_macro_body(m.group(1))}\n\n',
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Warning макрос
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="warning"[^>]*>(.*?)</ac:structured-macro>',
+        lambda m: f'\n\n⚠️ **WARNING:** {extract_macro_body(m.group(1))}\n\n',
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Note макрос
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="note"[^>]*>(.*?)</ac:structured-macro>',
+        lambda m: f'\n\n📝 **NOTE:** {extract_macro_body(m.group(1))}\n\n',
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Tip макрос
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="tip"[^>]*>(.*?)</ac:structured-macro>',
+        lambda m: f'\n\n💡 **TIP:** {extract_macro_body(m.group(1))}\n\n',
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Expand макрос (скрываемый контент)
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="expand"[^>]*>(.*?)</ac:structured-macro>',
+        lambda m: f'\n\n🔽 **EXPAND:** {extract_macro_body(m.group(1))}\n\n',
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Code макрос с языком
+    def replace_code_macro(match):
+        full_macro = match.group(0)
+        # Извлекаем язык
+        lang_match = re.search(r'<ac:parameter[^>]*ac:name="language"[^>]*>([^<]*)</ac:parameter>', full_macro)
+        language = lang_match.group(1) if lang_match else ''
+        # Извлекаем код
+        code_match = re.search(r'<ac:plain-text-body><!\[CDATA\[(.*?)\]\]></ac:plain-text-body>', full_macro, re.DOTALL)
+        code = code_match.group(1) if code_match else extract_macro_body(full_macro)
+        return f'\n\n```{language}\n{code}\n```\n\n'
+    
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="code"[^>]*>.*?</ac:structured-macro>',
+        replace_code_macro,
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Panel макрос
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="panel"[^>]*>(.*?)</ac:structured-macro>',
+        lambda m: f'\n\n📋 **PANEL:** {extract_macro_body(m.group(1))}\n\n',
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Status макрос
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="status"[^>]*>.*?<ac:parameter[^>]*ac:name="title"[^>]*>([^<]*)</ac:parameter>.*?</ac:structured-macro>',
+        lambda m: f'[STATUS: {m.group(1)}]',
+        html,
+        flags=re.DOTALL
+    )
+    
+    # TOC (Table of Contents) - удаляем, т.к. это автогенерируемое оглавление
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="toc"[^>]*>.*?</ac:structured-macro>',
+        '',
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Excerpt макрос (краткое содержание)
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="excerpt"[^>]*>(.*?)</ac:structured-macro>',
+        lambda m: f'\n\n📌 **EXCERPT:** {extract_macro_body(m.group(1))}\n\n',
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Quote макрос
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="quote"[^>]*>(.*?)</ac:structured-macro>',
+        lambda m: f'\n\n> {extract_macro_body(m.group(1))}\n\n',
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Page Properties макрос (структурированные данные)
+    def extract_page_properties(match):
+        full_macro = match.group(0)
+        # Ищем все параметры
+        props = []
+        prop_pattern = re.findall(r'<ac:parameter[^>]*ac:name="([^"]*)"[^>]*>([^<]*)</ac:parameter>', full_macro)
+        for key, value in prop_pattern:
+            if key and value:
+                props.append(f"{key}: {value}")
+        if props:
+            return f'\n\n📊 **PAGE PROPERTIES:**\n' + '\n'.join([f'  • {p}' for p in props]) + '\n\n'
+        return ''
+    
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="details"[^>]*>.*?</ac:structured-macro>',
+        extract_page_properties,
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Include Page макрос (транслюдированный контент)
+    def extract_include_page(match):
+        full_macro = match.group(0)
+        # Ищем ссылку на страницу
+        page_match = re.search(r'<ri:page[^>]*ri:content-title="([^"]*)"', full_macro)
+        if page_match:
+            page_title = page_match.group(1)
+            return f'\n\n🔗 **INCLUDES PAGE:** "{page_title}"\n\n'
+        return ''
+    
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="include"[^>]*>.*?</ac:structured-macro>',
+        extract_include_page,
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Children Display макрос (список дочерних страниц)
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="children"[^>]*>.*?</ac:structured-macro>',
+        '\n\n📑 **CHILD PAGES LIST**\n\n',
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Recently Updated макрос
+    html = re.sub(
+        r'<ac:structured-macro[^>]*ac:name="recently-updated"[^>]*>.*?</ac:structured-macro>',
+        '',
+        html,
+        flags=re.DOTALL
+    )
+    
+    # Confluence таблицы: конвертируем <ac:table> в <table>
+    html = re.sub(r'<ac:table>', '<table>', html)
+    html = re.sub(r'</ac:table>', '</table>', html)
+    html = re.sub(r'<ac:tr>', '<tr>', html)
+    html = re.sub(r'</ac:tr>', '</tr>', html)
+    html = re.sub(r'<ac:td>', '<td>', html)
+    html = re.sub(r'</ac:td>', '</td>', html)
+    html = re.sub(r'<ac:th>', '<th>', html)
+    html = re.sub(r'</ac:th>', '</th>', html)
+    
+    return html
+
+def convert_table_to_markdown(table_element) -> tuple[str, str]:
+    """Конвертирует HTML таблицу в markdown формат. Возвращает (markdown, html)."""
+    try:
+        table_html = str(table_element)
+        rows = []
+        for tr in table_element.find_all('tr'):
+            cells = []
+            for td in tr.find_all(['td', 'th']):
+                cell_text = td.get_text(separator=' ', strip=True)
+                cell_text = cell_text.replace('|', '\\|')
+                cells.append(cell_text)
+            if cells:
+                rows.append('| ' + ' | '.join(cells) + ' |')
+        
+        if not rows or len(rows) < 2:
+            return "", ""
+        
+        num_cols = len(rows[0].split('|')) - 2
+        if num_cols > 0 and len(rows) > 1:
+            separator = '| ' + ' | '.join(['---'] * num_cols) + ' |'
+            rows.insert(1, separator)
+        
+        markdown = '\n'.join(rows) if rows else ""
+        return markdown, table_html
+    except Exception as e:
+        logger.warning(f"Ошибка конвертации таблицы: {e}")
+        plain = table_element.get_text(separator=' ', strip=True)
+        return plain, str(table_element)
+
+def extract_list_text(list_element, tag: str) -> str:
+    """Извлекает текст из списка с правильными маркерами."""
+    try:
+        items = []
+        for li in list_element.find_all('li', recursive=False):
+            item_text = li.get_text(separator=' ', strip=True)
+            if item_text:
+                items.append(item_text)
+        
+        if not items:
+            return ""
+        
+        if tag == 'ul':
+            return '\n'.join([f"- {item}" for item in items])
+        else:
+            return '\n'.join([f"{i+1}. {item}" for i, item in enumerate(items)])
+    except Exception as e:
+        logger.warning(f"Ошибка извлечения списка: {e}")
+        return list_element.get_text(separator='\n', strip=True)
+
+def extract_structural_blocks(html_content: str) -> List[Dict[str, Any]]:
+    """Структурная нарезка HTML на логические блоки (таблицы, списки, текст)."""
+    if not html_content:
+        return []
+    
+    try:
+        html_content = preprocess_confluence_macros(html_content)
+        soup = BeautifulSoup(html_content, 'html.parser')
+        blocks = []
+        heading_stack = []
+        
+        def create_block(block_type: str, content: str, heading_stack: list, html: Optional[str] = None) -> Dict[str, Any]:
+            parent_path = " > ".join([h['text'] for h in heading_stack[:-1]]) if len(heading_stack) > 1 else ""
+            current_h = heading_stack[-1]['text'] if heading_stack else ""
+            block = {
+                "type": block_type,
+                "content": content,
+                "heading": current_h,
+                "level": heading_stack[-1]['level'] if heading_stack else 0,
+                "parent_path": parent_path,
+                "size": len(content)
+            }
+            if html:
+                block["html"] = html
+            return block
+        
+        def walk_tree(element):
+            if isinstance(element, NavigableString):
+                return
+            tag = element.name
+            if not tag:
+                return
+            
+            if tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                level = int(tag[1])
+                heading_text = element.get_text(strip=True)
+                if heading_text:
+                    heading_stack[:] = [h for h in heading_stack if h['level'] < level]
+                    heading_stack.append({"text": heading_text, "level": level})
+                for child in element.children:
+                    walk_tree(child)
+                return
+            
+            if tag == 'table':
+                table_md, table_html = convert_table_to_markdown(element)
+                if table_md:
+                    blocks.append(create_block("table", table_md, heading_stack, table_html))
+                    logger.debug(f"✓ Table block (size={len(table_md)} chars): '{heading_stack[-1]['text'] if heading_stack else 'no heading'}'")
+                return
+            
+            if tag in ['ul', 'ol']:
+                list_text = extract_list_text(element, tag)
+                if list_text:
+                    blocks.append(create_block("list", list_text, heading_stack))
+                return
+            
+            if tag in ['p', 'div', 'section', 'article']:
+                text = element.get_text(separator=' ', strip=True)
+                if text and len(text) > 20:
+                    blocks.append(create_block("text", text, heading_stack))
+                return
+            
+            for child in element.children:
+                walk_tree(child)
+        
+        root = soup.body if soup.body else soup
+        for child in root.children:
+            walk_tree(child)
+        
+        return blocks
+    except Exception as e:
+        logger.error(f"Ошибка структурной нарезки: {e}", exc_info=True)
+        text = html_to_text(html_content)
+        return [{"type": "text", "content": text, "heading": "", "level": 0, "parent_path": "", "size": len(text)}]
+
+def smart_chunk_with_context(blocks: List[Dict[str, Any]], max_size: int = MAX_CHUNK_SIZE) -> List[Dict[str, Any]]:
+    """Умная нарезка: таблицы и списки целиком, текст по предложениям."""
+    chunks = []
+    
+    for block in blocks:
+        block_type = block['type']
+        heading = block['heading']
+        level = block['level']
+        content = block['content']
+        size = block['size']
+        parent_path = block.get('parent_path', '')
+        
+        context_prefix = ""
+        if parent_path:
+            context_prefix = f"{parent_path} > {heading}\n\n" if heading else f"{parent_path}\n\n"
+        elif heading:
+            context_prefix = f"{heading}\n\n"
+        
+        if block_type in ['table', 'list']:
+            chunk = {
+                "text": context_prefix + content if context_prefix else content,
+                "heading": heading,
+                "level": level,
+                "type": block_type,
+                "parent_path": parent_path,
+                "size": size
+            }
+            if block_type == 'table' and 'html' in block:
+                chunk['html'] = block['html']
+            chunks.append(chunk)
+            logger.info(f"✓ {block_type.capitalize()} block (size={size} chars): '{heading}' in {parent_path or 'root'}")
+            continue
+        
+        if block_type == 'text':
+            if size <= max_size:
+                chunk = {
+                    "text": context_prefix + content if context_prefix else content,
+                    "heading": heading,
+                    "level": level,
+                    "type": block_type,
+                    "parent_path": parent_path,
+                    "size": size
+                }
+                chunks.append(chunk)
+            else:
+                logger.info(f"⚠ Text block too large ({size} > {max_size}), splitting: '{heading}'")
+                import re
+                sentences = re.split(r'(?<=[.!?])\s+', content)
+                current = ""
+                overlap_buffer = ""
+                
+                for sent in sentences:
+                    if len(current) + len(sent) + 1 < max_size:
+                        current += sent + " "
+                    else:
+                        if current.strip():
+                            chunk_text = context_prefix + (overlap_buffer + current).strip() if context_prefix else (overlap_buffer + current).strip()
+                            chunk = {
+                                "text": chunk_text,
+                                "heading": heading,
+                                "level": level,
+                                "type": block_type,
+                                "parent_path": parent_path,
+                                "size": len(chunk_text)
+                            }
+                            chunks.append(chunk)
+                            overlap_buffer = current[-CHUNK_OVERLAP:] if len(current) > CHUNK_OVERLAP else current
+                        current = sent + " "
+                
+                if current.strip():
+                    chunk_text = context_prefix + (overlap_buffer + current).strip() if context_prefix else (overlap_buffer + current).strip()
+                    chunk = {
+                        "text": chunk_text,
+                        "heading": heading,
+                        "level": level,
+                        "type": block_type,
+                        "parent_path": parent_path,
+                        "size": len(chunk_text)
+                    }
+                    chunks.append(chunk)
+    
+    return chunks if chunks else []
+
+def html_to_text(html: str, max_len: int = 50000) -> str:
+    """
+    Конвертация HTML Confluence в plain text с сохранением структуры и макросов.
+    
+    Args:
+        html: HTML контент
+        max_len: Максимальная длина для обработки
+    
+    Returns:
+        Plain text или пустая строка при ошибке
+    """
+    if not html:
+        return ""
+    try:
+        if len(html) > max_len:
+            html = html[:max_len]
+            logger.warning(f"HTML обрезан до {max_len} символов")
+        
+        # Предобработка Confluence макросов
+        html = preprocess_confluence_macros(html)
+        
+        h = html2text.HTML2Text()
+        # Улучшенные настройки для Confluence
+        h.ignore_links = False
+        h.body_width = 0
+        h.unicode_snob = True
+        h.ignore_images = False  # Сохранить ссылки на изображения
+        h.ignore_emphasis = False  # Сохранить форматирование (жирный, курсив)
+        h.skip_internal_links = False  # Сохранить внутренние ссылки
+        h.inline_links = False  # Ссылки в виде [text](url)
+        h.mark_code = True  # Отмечать код блоки
+        h.wrap_links = False  # Не переносить ссылки
+        h.default_image_alt = "[Изображение]"  # Альт для изображений
+        
+        text = h.handle(html).strip()
+        
+        # Очистка множественных пустых строк (больше 2 подряд)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        return text
+    except Exception as e:
+        logger.error(f"Ошибка конвертации HTML: {e}")
+        return ""
+
+def extract_sections(text: str) -> List[Dict[str, Any]]:
+    """
+    Извлекает секции документа по заголовкам (markdown формат) с сохранением иерархии.
+    
+    Args:
+        text: Текст в markdown формате (после html2text)
+    
+    Returns:
+        Список секций с заголовками, контентом и родительскими заголовками
+    """
+    lines = text.split('\n')
+    sections = []
+    current_section = {"heading": "", "level": 0, "content": [], "parent_headings": []}
+    heading_stack = []  # Стек заголовков для отслеживания иерархии
+    
+    heading_pattern = re.compile(r'^(#{1,6})\s+(.+)$')
+    
+    for line in lines:
+        match = heading_pattern.match(line)
+        if match:
+            # Сохраняем предыдущую секцию
+            if current_section["content"]:
+                sections.append(current_section)
+            
+            # Начинаем новую секцию
+            level = len(match.group(1))
+            heading = match.group(2).strip()
+            
+            # Обновляем стек заголовков: удаляем все заголовки того же или более низкого уровня
+            heading_stack = [h for h in heading_stack if h['level'] < level]
+            
+            # Создаем новую секцию с родительскими заголовками
+            parent_headings = [h['text'] for h in heading_stack]
+            current_section = {
+                "heading": heading, 
+                "level": level, 
+                "content": [line],
+                "parent_headings": parent_headings
+            }
+            
+            # Добавляем текущий заголовок в стек
+            heading_stack.append({'level': level, 'text': heading})
+        else:
+            current_section["content"].append(line)
+    
+    # Сохраняем последнюю секцию
+    if current_section["content"]:
+        sections.append(current_section)
+    
+    return sections
+
+def chunk_text(text: str, size: int = MAX_CHUNK_SIZE) -> List[Dict[str, Any]]:
+    """
+    Умное разбиение текста на семантические чанки с учётом заголовков.
+    
+    Args:
+        text: Исходный текст (markdown после html2text)
+        size: Максимальный размер чанка
+    
+    Returns:
+        Список чанков с metadata (heading, content)
+    """
+    if not text or len(text) < 100:
+        return [{"text": text, "heading": "", "level": 0}] if text else []
+    
+    # Извлекаем секции по заголовкам
+    sections = extract_sections(text)
+    
+    if not sections:
+        # Fallback: разбиение по параграфам
+        paras = [p.strip() for p in text.split('\n\n') if p.strip() and len(p.strip()) > 5]
+        chunks = []
+        current = ""
+        for para in paras:
+            if len(current) + len(para) + 2 < size:
+                current += para + "\n\n"
+            else:
+                if current.strip():
+                    chunks.append({"text": current.strip(), "heading": "", "level": 0})
+                current = para + "\n\n"
+        if current.strip():
+            chunks.append({"text": current.strip(), "heading": "", "level": 0})
+        return chunks if chunks else [{"text": text, "heading": "", "level": 0}]
+    
+    # Разбиваем секции на чанки
+    chunks = []
+    for section in sections:
+        heading = section["heading"]
+        level = section["level"]
+        parent_headings = section.get("parent_headings", [])
+        content = '\n'.join(section["content"])
+        
+        # Формируем префикс из родительских заголовков (только для уровня 3+)
+        context_prefix = ""
+        if level >= 3 and parent_headings:
+            # Добавляем родительские заголовки для контекста
+            context_prefix = " > ".join(parent_headings) + "\n\n"
+        
+        # Если секция целиком влезает в чанк
+        if len(content) <= size:
+            chunk_text = context_prefix + content.strip() if context_prefix else content.strip()
+            chunks.append({
+                "text": chunk_text,
+                "heading": heading,
+                "level": level
+            })
+        else:
+            # Разбиваем большую секцию по параграфам, сохраняя заголовок
+            paras = [p.strip() for p in content.split('\n\n') if p.strip()]
+            current = ""
+            for para in paras:
+                if len(current) + len(para) + 2 < size:
+                    current += para + "\n\n"
+                else:
+                    if current.strip():
+                        chunk_text = context_prefix + current.strip() if context_prefix else current.strip()
+                        chunks.append({
+                            "text": chunk_text,
+                            "heading": heading,
+                            "level": level
+                        })
+                    current = para + "\n\n"
+            if current.strip():
+                chunk_text = context_prefix + current.strip() if context_prefix else current.strip()
+                chunks.append({
+                    "text": chunk_text,
+                    "heading": heading,
+                    "level": level
+                })
+    
+    return chunks if chunks else [{"text": text, "heading": "", "level": 0}]
+
+def load_state() -> Dict[str, Any]:
+    """
+    Загрузка состояния синхронизации из файла.
+    
+    Returns:
+        Словарь с last_sync и pages
+    """
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+                logger.info(f"Загружено состояние: {len(state.get('pages', {}))} страниц")
+                return state
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка парсинга state file: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки состояния: {e}")
+    
+    logger.info("Создание нового состояния")
+    return {"last_sync": 0, "pages": {}}
+
+def save_state(state: Dict[str, Any]) -> None:
+    """
+    Сохранение состояния синхронизации в файл.
+    
+    Args:
+        state: Словарь с данными состояния
+    """
+    try:
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        logger.debug(f"Состояние сохранено: {len(state.get('pages', {}))} страниц")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения состояния: {e}")
+
+# init_embeddings() теперь импортируется из embeddings.py как get_embed_model()
+
+def process_batch(index: Any, collection: Any, confluence: Confluence, 
+                  pages: List[Dict[str, Any]], state: Dict[str, Any], space_key: str) -> tuple[int, int, int, list]:
+    """
+    Обработка batch страниц Confluence.
+    
+    Returns:
+        Tuple[updated, errors, skipped, error_details] - статистика обработки
+    """
+    # Тестовый режим
+    if TEST_MODE:
+        pages = pages[:TEST_MAX_PAGES]
+        logger.info(f"🧪 TEST MODE ENABLED - Processing only first {len(pages)} pages")
+    
+    updated, errors, skipped = 0, 0, 0
+    error_details = []  # Список деталей ошибок
+    for page in pages:
+        pid = str(page.get('id', ''))
+        if not pid:
+            skipped += 1
+            continue
+        title = page.get('title', 'Unknown')
+        ts = get_timestamp(page)
+        try:
+            if pid in state['pages'] and state['pages'][pid].get('updated') == ts:
+                skipped += 1
+                continue
+            try:
+                page_data = get_page(confluence, pid)
+            except Exception as e:
+                error_msg = f"Не удалось получить страницу {pid} ({title}): {e}"
+                logger.warning(error_msg)
+                error_details.append(error_msg)
+                skipped += 1
+                continue
+            
+            # Извлечение расширенных метаданных
+            page_metadata = extract_page_metadata(page_data)
+            
+            # Получаем список вложений
+            page_metadata['attachments'] = get_page_attachments(confluence, pid)
+            
+            html = page_data.get('body', {}).get('storage', {}).get('value', '')
+            if not html or len(html) < MIN_TEXT_LEN:
+                skipped += 1
+                continue
+            
+            # Структурная нарезка
+            blocks = extract_structural_blocks(html)
+            if not blocks:
+                skipped += 1
+                continue
+            
+            chunks = smart_chunk_with_context(blocks, max_size=MAX_CHUNK_SIZE)
+            try:
+                existing = collection.get(where={"page_id": pid})
+                if existing.get("ids"):
+                    collection.delete(ids=existing["ids"])
+            except Exception as e:
+                logger.debug(f"Не удалось удалить старые чанки для {pid}: {e}")
+            inserted = 0
+            for i, chunk_data in enumerate(chunks):
+                # chunk_data теперь словарь с ключами: text, heading, level
+                if not isinstance(chunk_data, dict):
+                    logger.warning(f"Unexpected chunk_data type: {type(chunk_data)}")
+                    continue
+                
+                chunk_content = chunk_data.get("text", "")
+                if not chunk_content or len(chunk_content) < 20:
+                    continue
+                
+                page_url = f"{CONFLUENCE_URL.rstrip('/')}/wiki/spaces/{space_key}/pages/{pid}"
+                
+                # Полные метаданные: базовые + заголовки + Confluence метаданные
+                labels_list = page_metadata.get('labels', [])
+                labels_str = ",".join(labels_list) if labels_list else ""
+                
+                attachments_list = page_metadata.get('attachments', [])
+                attachments_str = ",".join(attachments_list) if attachments_list else ""
+                
+                # Ограничиваем длину строковых полей (ChromaDB limits)
+                max_str_len = 500
+                title_safe = title[:max_str_len] if title else "Unknown"
+                heading_safe = chunk_data.get("heading", "")[:max_str_len]
+                labels_safe = labels_str[:max_str_len]
+                parent_safe = page_metadata.get('parent_title', '')[:max_str_len]
+                author_safe = page_metadata.get('created_by', '')[:max_str_len]
+                attachments_safe = attachments_str[:max_str_len]
+                parent_path_safe = chunk_data.get("parent_path", "")[:max_str_len]
+                
+                # Обогащенные метаданные
+                block_type = chunk_data.get("type", "text")
+                block_size = chunk_data.get("size", 0)
+                is_complete = block_type in ["table", "list"]
+                heading_path = (parent_path_safe + " > " + heading_safe if parent_path_safe else heading_safe)[:max_str_len]
+                
+                # НОВОЕ: Полный путь страницы
+                page_path_safe = page_metadata.get('page_path', '')[:max_str_len]
+                
+                metadata = {
+                    # Базовые
+                    "page_id": pid,
+                    "chunk": i,
+                    "title": title_safe,
+                    "space": space_key,
+                    "url": page_url,
+                    # Структура документа
+                    "heading": heading_safe,
+                    "heading_level": chunk_data.get("level", 0),
+                    # НОВЫЕ ПОЛЯ для структурной нарезки
+                    "type": block_type,                          # table|list|text
+                    "parent_path": parent_path_safe,             # Иерархия заголовков
+                    "block_size": block_size,                    # Размер блока
+                    "is_complete_block": is_complete,            # Целый блок или часть
+                    "has_table": block_type == "table",          # Содержит таблицу
+                    "heading_path": heading_path,                # Полный путь
+                    # Confluence метаданные
+                    "labels": labels_safe,
+                    "parent_title": parent_safe,                 # Родительская страница (ближайший)
+                    "page_path": page_path_safe,                 # НОВОЕ: Полный путь страницы
+                    "created_by": author_safe,
+                    "has_children": page_metadata.get('has_children', False),
+                    "version": page_metadata.get('version', 1),
+                    "attachments": attachments_safe  # Список вложений
+                }
+                
+                doc = Document(text=chunk_content, metadata=metadata)
+                try:
+                    index.insert(doc)
+                    inserted += 1
+                except Exception as e:
+                    logger.debug(f"Ошибка вставки чанка {i}: {e}")
+                    continue
+            if inserted > 0:
+                state['pages'][pid] = {'updated': ts, 'chunks': inserted}
+                updated += 1
+            else:
+                skipped += 1
+        except Exception as e:
+            import traceback
+            error_msg = f"Error processing page {pid} ({title}): {e}"
+            logger.error(error_msg)
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            error_details.append(error_msg)
+            errors += 1
+    return updated, errors, skipped, error_details
+
+def get_blogposts_from_space(confluence: Confluence, space_key: str, start: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Получение blog posts из space (обёртка для API).
+    
+    Args:
+        confluence: Confluence API client
+        space_key: Ключ пространства
+        start: Начальная позиция
+        limit: Количество постов
+    
+    Returns:
+        Список blog posts
+    """
+    try:
+        # API запрос для блогов
+        url = f"{confluence.url}/rest/api/content?type=blogpost&spaceKey={space_key}&start={start}&limit={limit}&expand=version"
+        response = requests.get(url, headers=confluence.default_headers, verify=VERIFY_SSL)
+        response.raise_for_status()
+        data = response.json()
+        return data.get('results', [])
+    except Exception as e:
+        logger.debug(f"Ошибка получения blogposts для {space_key}: {e}")
+        return []
+
+def cleanup_deleted_pages(collection, state: Dict[str, Any], current_page_ids: set) -> int:
+    """
+    Удаление документов из индекса для страниц, которые были удалены в Confluence.
+    
+    Args:
+        collection: ChromaDB collection
+        state: Текущее состояние синхронизации
+        current_page_ids: Набор ID страниц, которые существуют в Confluence
+    
+    Returns:
+        Количество удалённых страниц
+    """
+    deleted_count = 0
+    state_page_ids = set(state.get('pages', {}).keys())
+    deleted_page_ids = state_page_ids - current_page_ids
+    
+    if not deleted_page_ids:
+        logger.debug("Нет удалённых страниц для очистки")
+        return 0
+    
+    logger.info(f"Обнаружено {len(deleted_page_ids)} удалённых страниц в Confluence")
+    
+    for page_id in deleted_page_ids:
+        try:
+            # Удаление всех чанков этой страницы из ChromaDB
+            existing = collection.get(where={"page_id": page_id})
+            if existing.get("ids"):
+                collection.delete(ids=existing["ids"])
+                logger.info(f"  Удалена страница {page_id} ({len(existing['ids'])} чанков)")
+                deleted_count += 1
+            
+            # Удаление из state
+            if page_id in state['pages']:
+                del state['pages'][page_id]
+        except Exception as e:
+            logger.error(f"Ошибка удаления страницы {page_id}: {e}")
+    
+    return deleted_count
+
+def sync() -> None:
+    """Основной процесс синхронизации Confluence с ChromaDB."""
+    logger.info("Sync started")
+    state = load_state()
+    start_time = time.time()
+    try:
+        # Примечание: параметр verify_ssl не поддерживается в текущей версии atlassian-python-api
+        confluence = Confluence(url=CONFLUENCE_URL, token=CONFLUENCE_TOKEN)
+        logger.info("Connected to Confluence")
+    except Exception as e:
+        logger.error(f"Confluence error: {e}")
+        return
+    try:
+        from embeddings import validate_collection_dimension, get_embedding_dimension
+        
+        logger.info("Шаг 1: Инициализация ChromaDB...")
+        client = chromadb.PersistentClient(path=CHROMA_PATH)
+        
+        # Проверяем, существует ли коллекция
+        existing_collections = [col.name for col in client.list_collections()]
+        collection_exists = "confluence" in existing_collections
+        
+        if collection_exists:
+            collection = client.get_collection(name="confluence")
+        else:
+            collection = client.get_or_create_collection(
+                name="confluence", 
+                metadata={"hnsw:space": "cosine"}
+            )
+        
+        logger.info("Шаг 2: Загрузка embedding модели (может занять ~60 сек)...")
+        embed_model = get_embed_model()
+        logger.info(f"✅ Модель загружена: {type(embed_model)}")
+        
+        # ВАЖНО: Проверяем размерность перед синхронизацией
+        if collection_exists and collection.count() > 0:
+            is_valid, coll_dim, model_dim = validate_collection_dimension(collection)
+            
+            if not is_valid:
+                # Несовпадение размерности - критическая ошибка
+                error_msg = (
+                    f"\n{'='*60}\n"
+                    f"⚠️  КРИТИЧЕСКАЯ ОШИБКА: НЕСОВПАДЕНИЕ РАЗМЕРНОСТИ\n"
+                    f"{'='*60}\n"
+                    f"ChromaDB содержит embeddings размерностью {coll_dim}D,\n"
+                    f"но модель {EMBED_MODEL} генерирует {model_dim}D векторы.\n\n"
+                    f"Синхронизация невозможна с несовместимой моделью!\n\n"
+                    f"РЕШЕНИЕ:\n"
+                    f"1. Остановите контейнер: docker-compose down\n"
+                    f"2. Удалите базу: rm -rf ./chroma_data ./data/sync_state.json\n"
+                    f"3. Запустите заново: docker-compose up -d\n"
+                    f"\n"
+                    f"Это пересоздаст базу и переиндексирует все документы.\n"
+                    f"{'='*60}\n"
+                )
+                logger.error(error_msg)
+                raise ValueError(
+                    f"Dimension mismatch: ChromaDB={coll_dim}D, Model={model_dim}D. "
+                    f"Delete chroma_data directory and restart."
+                )
+            else:
+                logger.info(f"✅ Размерность embeddings корректна: {model_dim}D")
+        
+        logger.info("Шаг 3: Создание vector store...")
+        vector_store = ChromaVectorStore(chroma_collection=collection)
+        logger.info("Шаг 3.1: Создание storage context...")
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        logger.info("Шаг 4: Создание index...")
+        index = VectorStoreIndex.from_documents([], storage_context=storage_context, embed_model=embed_model)
+        logger.info("✅ Index initialized")
+    except ValueError as ve:
+        # Это ошибка несовпадения размерности - не продолжаем
+        logger.error(f"Sync остановлен: {ve}")
+        return
+    except Exception as e:
+        logger.error(f"Init error: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return
+    total_updated, total_errors, total_skipped = 0, 0, 0
+    current_page_ids = set()  # Для отслеживания существующих страниц
+    
+    # Словарь для статистики по пространствам
+    space_stats = {}
+    
+    try:
+        all_spaces = confluence.get_all_spaces().get('results', [])
+        
+        # Фильтрация пространств
+        if CONFLUENCE_SPACES:
+            # Парсим список пространств из ENV (через запятую)
+            target_spaces = [s.strip().upper() for s in CONFLUENCE_SPACES.split(',') if s.strip()]
+            spaces = [s for s in all_spaces if s.get('key', '').upper() in target_spaces]
+            
+            # Предупреждение, если оба параметра указаны
+            if MAX_SPACES != 10:  # Если MAX_SPACES изменен от значения по умолчанию
+                logger.warning(f"⚠️  Указаны оба параметра: CONFLUENCE_SPACES и MAX_SPACES={MAX_SPACES}")
+                logger.warning(f"   Используется CONFLUENCE_SPACES (MAX_SPACES игнорируется)")
+            
+            logger.info(f"Фильтр пространств: {len(spaces)} из {len(all_spaces)} (указаны: {CONFLUENCE_SPACES})")
+            
+            # Предупреждение, если некоторые указанные пространства не найдены
+            found_keys = {s.get('key', '').upper() for s in spaces}
+            not_found = [t for t in target_spaces if t not in found_keys]
+            if not_found:
+                logger.warning(f"⚠️  Пространства не найдены в Confluence: {', '.join(not_found)}")
+        else:
+            # Старое поведение: MAX_SPACES
+            spaces = all_spaces[:MAX_SPACES]
+            logger.info(f"Processing {len(spaces)} spaces (MAX_SPACES={MAX_SPACES})")
+        
+        for space in spaces:
+            key = space.get('key', '')
+            if not key:
+                continue
+            
+            # Инициализация статистики для пространства
+            space_stats[key] = {
+                'total_pages': 0,
+                'total_blogs': 0,
+                'processed': 0,
+                'updated': 0,
+                'skipped': 0,
+                'errors': 0,
+                'chunks_created': 0,
+                'error_details': []
+            }
+            
+            logger.info(f"Space: {key}")
+            try:
+                all_pages = []
+                start = 0
+                while True:
+                    batch_pages = list(confluence.get_all_pages_from_space(key, start=start, limit=BATCH_SIZE))
+                    if not batch_pages:
+                        break
+                    all_pages.extend(batch_pages)
+                    start += BATCH_SIZE
+                
+                # Собираем ID всех существующих страниц
+                for page in all_pages:
+                    page_id = str(page.get('id', ''))
+                    if page_id:
+                        current_page_ids.add(page_id)
+                
+                space_stats[key]['total_pages'] = len(all_pages)
+                logger.info(f"  {key}: {len(all_pages)} total pages")
+                
+                for i in range(0, len(all_pages), BATCH_SIZE):
+                    batch = all_pages[i:i+BATCH_SIZE]
+                    updated, errors, skipped, error_details = process_batch(index, collection, confluence, batch, state, key)
+                    total_updated += updated
+                    total_errors += errors
+                    total_skipped += skipped
+                    space_stats[key]['updated'] += updated
+                    space_stats[key]['errors'] += errors
+                    space_stats[key]['skipped'] += skipped
+                    space_stats[key]['processed'] += len(batch)
+                    space_stats[key]['error_details'].extend(error_details)
+                    logger.info(f"  Batch {i//BATCH_SIZE + 1}: {updated} updated, {skipped} skipped, {errors} errors")
+                
+                # Обработка blog posts
+                try:
+                    all_blogs = []
+                    blog_start = 0
+                    while True:
+                        batch_blogs = get_blogposts_from_space(confluence, key, start=blog_start, limit=BATCH_SIZE)
+                        if not batch_blogs:
+                            break
+                        all_blogs.extend(batch_blogs)
+                        blog_start += BATCH_SIZE
+                    
+                    # Собираем ID блогов
+                    for blog in all_blogs:
+                        blog_id = str(blog.get('id', ''))
+                        if blog_id:
+                            current_page_ids.add(blog_id)
+                    
+                    space_stats[key]['total_blogs'] = len(all_blogs)
+                    if all_blogs:
+                        logger.info(f"  {key}: {len(all_blogs)} blog posts")
+                        for i in range(0, len(all_blogs), BATCH_SIZE):
+                            batch = all_blogs[i:i+BATCH_SIZE]
+                            updated, errors, skipped, error_details = process_batch(index, collection, confluence, batch, state, key)
+                            total_updated += updated
+                            total_errors += errors
+                            total_skipped += skipped
+                            space_stats[key]['updated'] += updated
+                            space_stats[key]['errors'] += errors
+                            space_stats[key]['skipped'] += skipped
+                            space_stats[key]['processed'] += len(batch)
+                            space_stats[key]['error_details'].extend(error_details)
+                            logger.info(f"  Blog batch {i//BATCH_SIZE + 1}: {updated} updated, {skipped} skipped, {errors} errors")
+                except Exception as blog_err:
+                    logger.warning(f"Error processing blogs for {key}: {blog_err}")
+                    space_stats[key]['error_details'].append(f"Blog processing error: {str(blog_err)}")
+                    
+            except Exception as e:
+                logger.error(f"Space error: {e}")
+                total_errors += 1
+                space_stats[key]['errors'] += 1
+                space_stats[key]['error_details'].append(f"Space processing error: {str(e)}")
+    except Exception as e:
+        logger.error(f"Critical: {e}")
+        return
+    
+    # Подсчет chunks для каждого пространства
+    try:
+        for space_key in space_stats.keys():
+            space_data = collection.get(where={"space": space_key}, limit=10000)
+            space_stats[space_key]['chunks_created'] = len(space_data.get('ids', []))
+    except Exception as e:
+        logger.warning(f"Не удалось подсчитать chunks по пространствам: {e}")
+    
+    # Очистка удалённых страниц
+    deleted_count = cleanup_deleted_pages(collection, state, current_page_ids)
+    
+    # ============ НОВОЕ: Извлекаем доменные термины из Confluence ============
+    try:
+        from synonyms_manager import get_synonyms_manager
+        
+        logger.info("🔍 Извлечение доменных терминов из Confluence...")
+        synonyms_manager = get_synonyms_manager()
+        domain_terms = synonyms_manager.extract_domain_terms_from_confluence(collection)
+        logger.info(f"✅ Извлечено {len(domain_terms)} доменных терминов")
+    except Exception as e:
+        logger.warning(f"Не удалось извлечь доменные термины: {e}")
+    
+    state['last_sync'] = int(time.time())
+    save_state(state)
+    elapsed = time.time() - start_time
+    
+    # ============ ДЕТАЛЬНАЯ СТАТИСТИКА ПО ПРОСТРАНСТВАМ ============
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("📊 ИТОГИ СИНХРОНИЗАЦИИ")
+    logger.info("=" * 80)
+    logger.info(f"⏱  Время выполнения: {elapsed:.1f}с ({elapsed/60:.1f} мин)")
+    logger.info("")
+    logger.info("📁 СТАТИСТИКА ПО ПРОСТРАНСТВАМ:")
+    logger.info("-" * 80)
+    
+    for space_key, stats in sorted(space_stats.items()):
+        logger.info(f"  📂 {space_key}:")
+        logger.info(f"     Страниц найдено: {stats['total_pages']} (блогов: {stats['total_blogs']})")
+        logger.info(f"     Обработано: {stats['processed']}")
+        logger.info(f"     Обновлено: {stats['updated']} | Пропущено: {stats['skipped']} | Ошибок: {stats['errors']}")
+        logger.info(f"     Chunks создано: {stats['chunks_created']}")
+        if stats['error_details']:
+            logger.warning(f"     ⚠️  Ошибки ({len(stats['error_details'])}):")
+            for err in stats['error_details'][:5]:  # Показываем первые 5 ошибок
+                logger.warning(f"        - {err}")
+            if len(stats['error_details']) > 5:
+                logger.warning(f"        ... и еще {len(stats['error_details']) - 5} ошибок")
+        logger.info("")
+    
+    logger.info("=" * 80)
+    logger.info("📈 ОБЩАЯ СТАТИСТИКА:")
+    logger.info(f"   ✅ Обновлено: {total_updated}")
+    logger.info(f"   ⏭  Пропущено: {total_skipped}")
+    logger.info(f"   ❌ Ошибок: {total_errors}")
+    logger.info(f"   🗑  Удалено: {deleted_count}")
+    logger.info(f"   ⏱  Время: {elapsed:.1f}с")
+    logger.info("=" * 80)
+
+if __name__ == "__main__":
+    sync()
+    logger.info(f"Синхронизация будет повторяться каждые {SYNC_INTERVAL} секунд ({SYNC_INTERVAL/3600:.1f} часов)")
+    while True:
+        try:
+            time.sleep(SYNC_INTERVAL)
+            sync()
+        except KeyboardInterrupt:
+            logger.info("Получен сигнал остановки, завершение работы...")
+            break
+        except Exception as e:
+            logger.error(f"Критическая ошибка в главном цикле: {e}")
+            time.sleep(60)

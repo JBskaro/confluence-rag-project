@@ -1,0 +1,31 @@
+services:
+  confluence-rag:
+    build:
+      context: .
+      dockerfile: Dockerfile.standalone
+    container_name: confluence-rag
+    volumes:
+      - ./chroma_data:/app/chroma_data
+      - ./data:/app/data
+    ports:
+      - "8012:8012"
+    networks:
+      - vless-proxy
+    env_file:
+      - .env
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f -H 'Accept: application/json' http://localhost:8012/mcp || exit 0"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+networks:
+  vless-proxy:
+    external: true

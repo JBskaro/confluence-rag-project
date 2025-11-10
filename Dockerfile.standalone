@@ -1,0 +1,38 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Установка системных зависимостей
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Копирование requirements для кеширования слоя
+COPY requirements.txt .
+RUN pip install --no-cache-dir -q -r requirements.txt
+
+# Копирование кода приложения
+COPY rag_server/embeddings.py embeddings.py
+COPY rag_server/synonyms_manager.py synonyms_manager.py
+COPY rag_server/semantic_cache.py semantic_cache.py
+COPY rag_server/semantic_query_log.py semantic_query_log.py
+COPY rag_server/advanced_search.py advanced_search.py
+COPY rag_server/query_rewriter.py query_rewriter.py
+COPY rag_server/hybrid_search.py hybrid_search.py
+COPY rag_server/context_expansion.py context_expansion.py
+COPY rag_server/sync_confluence_optimized_final.py sync.py
+COPY rag_server/mcp_rag_secure.py server.py
+
+# Переменные окружения
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONIOENCODING=utf-8
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+# Health check: проверяет MCP сервер И наличие данных в ChromaDB
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD python -c "import chromadb; c=chromadb.PersistentClient(path='./chroma_data'); coll=c.get_collection('confluence'); exit(0 if coll.count()>0 else 1)" 2>/dev/null || curl -f -H "Accept: application/json" http://localhost:8012/mcp || exit 0
+
+# Запуск sync и server
+# Модель инициализируется автоматически при импорте server.py (на уровне модуля)
+CMD ["bash", "-c", "python sync.py & python server.py"]

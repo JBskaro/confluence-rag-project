@@ -1,0 +1,369 @@
+# ============================================
+# Confluence RAG Configuration Template
+# ============================================
+# Скопируйте этот файл как .env и заполните значения
+
+# ============================================
+# ОБЯЗАТЕЛЬНЫЕ ПАРАМЕТРЫ
+# ============================================
+
+# URL вашего Confluence (обязательно с "/" в конце!)
+CONFLUENCE_URL=https://your-company.atlassian.net/
+
+# API Token от Confluence
+# Получить: https://id.atlassian.com/manage-profile/security/api-tokens
+CONFLUENCE_TOKEN=your_api_token_here
+
+
+# ============================================
+# ХРАНИЛИЩЕ ДАННЫХ
+# ============================================
+
+# Путь к базе данных ChromaDB
+CHROMA_PATH=./chroma_data
+
+# Файл состояния синхронизации
+STATE_FILE=./sync_state.json
+
+
+# ============================================
+# МОДЕЛЬ ЭМБЕДДИНГОВ
+# ============================================
+# Приоритет выбора модели:
+# 1. OpenAI-compatible API (если указан OPENAI_API_BASE)
+#    - OpenRouter: https://openrouter.ai/api/v1
+#    - Ollama: http://localhost:11434/v1
+#    - LM Studio и др.
+# 2. Ollama через LlamaIndex (если USE_OLLAMA=true)
+# 3. HuggingFace (локально, по умолчанию)
+#
+# ВАЖНО: Если указана модель, она должна быть доступна.
+# При смене модели необходимо удалить базу данных вручную.
+
+# OpenAI-compatible API (для OpenRouter, Ollama, LM Studio и др.)
+# OpenRouter: https://openrouter.ai/api/v1
+# Ollama: http://localhost:11434/v1
+# Формат: https://openrouter.ai/api/v1 или http://host:port/v1
+# Если указан, будет использован в первую очередь
+OPENAI_API_BASE=
+
+# API ключ для OpenAI-compatible API
+# OpenRouter: ваш API ключ (sk-or-v1-...)
+# Ollama: обычно "ollama" или не нужен
+OPENAI_API_KEY=
+
+# Имя модели для OpenAI-compatible API (если не указано, используется EMBED_MODEL)
+# OpenRouter: qwen/qwen3-embedding-8b, qwen/qwen3-embedding-4b, qwen/qwen3-embedding-1.7b и др.
+# Ollama: nomic-embed-text, all-minilm, qwen3-embedding-4b и др.
+OPENAI_MODEL=
+
+# Использовать Ollama через LlamaIndex? (только если OPENAI_API_BASE не указан)
+# false = HuggingFace (локально, рекомендуется)
+# true = Ollama (требует отдельный сервер)
+USE_OLLAMA=false
+
+# URL Ollama сервера (только если USE_OLLAMA=true)
+OLLAMA_URL=http://ollama:11434
+
+# Модель для эмбеддингов (используется если OPENAI_API_BASE не указан)
+# HuggingFace: ai-forever/FRIDA (русский+английский)
+# Ollama: nomic-embed-text, all-minilm
+EMBED_MODEL=ai-forever/FRIDA
+
+
+# ============================================
+# EMBEDDING SOURCE (выбор источника embeddings)
+# ============================================
+# Какой источник использовать для embeddings?
+#   openrouter  - OpenRouter (облако, качественно) ✓ РЕКОМЕНДУЕТСЯ
+#   ollama      - Ollama (локально, бесплатно)
+#   huggingface - HuggingFace (локально, бесплатно)
+#   (пусто)     - Автоматический выбор (старая логика):
+#                 1. OPENAI_API_BASE (если указан)
+#                 2. USE_OLLAMA=true (если указан)
+#                 3. HuggingFace (по умолчанию)
+# По умолчанию: пусто (старая логика для совместимости)
+EMBEDDING_SOURCE=
+
+# === Если EMBEDDING_SOURCE=openrouter ===
+# Требует: OPENAI_API_BASE, OPENAI_API_KEY, OPENAI_MODEL
+# Смотри раздел "МОДЕЛЬ ЭМБЕДДИНГОВ" выше
+
+# === Если EMBEDDING_SOURCE=ollama ===
+# Требует: OLLAMA_URL, OLLAMA_EMBEDDING_MODEL (или использует OLLAMA_MODEL)
+# Смотри раздел "МОДЕЛЬ ЭМБЕДДИНГОВ" выше
+
+# === Если EMBEDDING_SOURCE=huggingface ===
+# Используется модель из EMBED_MODEL (по умолчанию: ai-forever/FRIDA)
+# Загружается автоматически при первом использовании
+
+
+# ============================================
+# ПАРАМЕТРЫ СИНХРОНИЗАЦИИ
+# ============================================
+
+# Максимальное количество спейсов для обработки
+MAX_SPACES=10
+
+# Фильтр пространств для индексации (через запятую, например: RAUII,MAP,MD)
+# Если указан, используется вместо MAX_SPACES (MAX_SPACES игнорируется)
+# Если не указан, используется MAX_SPACES (первые N пространств)
+# ВАЖНО: Если указаны оба параметра, CONFLUENCE_SPACES имеет приоритет
+CONFLUENCE_SPACES=
+
+# Размер чанка (количество символов)
+# Меньше = точнее поиск, больше запросов
+# Больше = быстрее, но менее точно
+MAX_CHUNK_SIZE=500
+
+# Минимальная длина текста страницы (символов)
+# Страницы короче будут пропущены
+MIN_TEXT_LEN=50
+
+# Размер батча для обработки страниц
+# Больше = быстрее, но больше памяти
+BATCH_SIZE=50
+
+
+# ============================================
+# HYBRID SEARCH (Vector + BM25)
+# ============================================
+# Объединение векторного и full-text поиска через Reciprocal Rank Fusion (RRF)
+# Это стандартный подход, используемый Google, OpenAI, Meta, Microsoft, AWS
+
+# Включить Hybrid Search (Vector + BM25)?
+# true = включен (рекомендуется, улучшает точность на 15-25%)
+# false = только векторный поиск
+ENABLE_HYBRID_SEARCH=true
+
+# Веса для объединения результатов (сумма должна быть ~1.0)
+# Векторный поиск лучше для семантического поиска
+# BM25 лучше для точных совпадений ключевых слов
+# Эти веса используются по умолчанию, если адаптивные веса не настроены
+HYBRID_VECTOR_WEIGHT=0.6  # Вес векторного поиска (0.0-1.0)
+HYBRID_BM25_WEIGHT=0.4    # Вес BM25 поиска (0.0-1.0)
+
+# Адаптивные веса для разных типов запросов
+# Система автоматически определяет тип запроса и использует соответствующие веса
+# Navigational (поиск конкретной информации): больше векторный поиск
+HYBRID_VECTOR_WEIGHT_NAVIGATIONAL=0.7
+HYBRID_BM25_WEIGHT_NAVIGATIONAL=0.3
+
+# Exploratory (исследовательский поиск): равные веса
+HYBRID_VECTOR_WEIGHT_EXPLORATORY=0.5
+HYBRID_BM25_WEIGHT_EXPLORATORY=0.5
+
+# Factual (фактический поиск): стандартные веса
+HYBRID_VECTOR_WEIGHT_FACTUAL=0.6
+HYBRID_BM25_WEIGHT_FACTUAL=0.4
+
+# HowTo (инструкции): немного больше векторный поиск
+HYBRID_VECTOR_WEIGHT_HOWTO=0.55
+HYBRID_BM25_WEIGHT_HOWTO=0.45
+
+# Параметр Reciprocal Rank Fusion (стандарт: 60)
+# Больше значение = больше влияние ранга
+HYBRID_RRF_K=60
+
+# Максимальное количество документов для BM25 индексации
+# Увеличьте если у вас больше 50K документов
+BM25_MAX_DOCS=50000
+
+
+# ============================================
+# RE-RANKING (CrossEncoder)
+# ============================================
+# Переранжирование результатов поиска для улучшения релевантности
+# Использует CrossEncoder для оценки релевантности (query, document) пар
+
+# Модель re-ranker
+# По умолчанию: DiTy/cross-encoder-russian-msmarco (Russian MS-MARCO, оптимально для русского)
+# Альтернативы:
+#   - cross-encoder/ms-marco-MiniLM-L-6-v2 (универсальная, английский-ориентированная)
+#   - Qwen/Qwen3-Reranker-8B (многоязычная, требует больше ресурсов)
+RE_RANKER_MODEL=DiTy/cross-encoder-russian-msmarco
+
+# Пороги фильтрации результатов по rerank score
+# ВАЖНО: Диапазон scores зависит от модели!
+# Для DiTy/cross-encoder-russian-msmarco: scores обычно в диапазоне 0-1
+# 
+# На основе анализа реальных scores (диапазон: 0.001 - 0.295):
+#   - TECHNICAL=0.01  (пропустит топ-60% результатов)
+#   - GENERAL=0.005   (пропустит топ-70% результатов)
+# 
+# Для временного отключения фильтрации (анализ scores):
+#   RERANK_THRESHOLD_TECHNICAL=0
+#   RERANK_THRESHOLD_GENERAL=0
+
+# Технические запросы (ниже порог, т.к. специфичные термины)
+RERANK_THRESHOLD_TECHNICAL=0.01
+
+# Общие запросы (выше порог для лучшей релевантности)
+RERANK_THRESHOLD_GENERAL=0.005
+
+
+# ============================================
+# БЕЗОПАСНОСТЬ
+# ============================================
+
+# Проверять SSL сертификаты?
+# true = безопасно (production)
+# false = без проверки (только для тестирования!)
+VERIFY_SSL=true
+
+
+# ============================================
+# ДОПОЛНИТЕЛЬНО
+# ============================================
+
+# Уровень логирования (DEBUG, INFO, WARNING, ERROR)
+LOG_LEVEL=INFO
+
+# Интервал синхронизации в секундах (по умолчанию 3600 = 1 час)
+SYNC_INTERVAL=3600
+
+
+# ============================================
+# QUERY EXPANSION - SEMANTIC QUERY LOG (5-й источник)
+# ============================================
+# Логирование успешных поисковых запросов для использования в расширении запросов
+
+# Файл для хранения лога успешных запросов
+QUERY_LOG_FILE=./data/query_log_semantic.json
+
+# Минимальный рейтинг для успешного запроса (1-5 звёзд)
+# Запросы с рейтингом >= этого значения считаются успешными
+QUERY_LOG_MIN_RATING=4.0
+
+# Максимальный размер лога (количество записей)
+# При превышении лимита удаляются старые/неуспешные записи
+QUERY_LOG_MAX_SIZE=10000
+
+
+# ============================================
+# QUERY REWRITING (LLM-based Query Expansion)
+# ============================================
+# Переписывание запросов с помощью LLM для генерации альтернативных формулировок
+# Используется как один из источников расширения запросов в expand_query()
+#
+# Приоритет провайдеров:
+# 1. Ollama (локальный, быстрый) - если USE_OLLAMA_FOR_QUERY_EXPANSION=true
+# 2. OpenRouter (облачный, качественный) - если USE_OPENROUTER_FOR_REWRITING=true
+# 3. Без переписки (graceful degradation) - если оба отключены
+
+# Использовать Ollama для переписки запросов?
+# true = включен (рекомендуется, если есть локальный Ollama сервер)
+# false = отключен
+USE_OLLAMA_FOR_QUERY_EXPANSION=true
+
+# Использовать OpenRouter для переписки (fallback, опционально)?
+# true = включен (используется если Ollama недоступен или отключен)
+# false = отключен
+# ВАЖНО: Требует настройки OPENAI_API_BASE, OPENAI_API_KEY, OPENAI_MODEL (см. раздел "МОДЕЛЬ ЭМБЕДДИНГОВ")
+USE_OPENROUTER_FOR_REWRITING=false
+
+# ============================================
+# QUERY REWRITING SOURCE (выбор источника для rewriting)
+# ============================================
+# Какой источник использовать для query rewriting?
+#   openrouter  - OpenRouter (облако, качественно) ✓ РЕКОМЕНДУЕТСЯ
+#   ollama      - Ollama (локально, бесплатно)
+#   (пусто)     - Автоматический выбор (старая логика):
+#                 1. Ollama (если USE_OLLAMA_FOR_QUERY_EXPANSION=true)
+#                 2. OpenRouter (если USE_OPENROUTER_FOR_REWRITING=true)
+#                 3. Без переписки (graceful degradation)
+# По умолчанию: пусто (старая логика для совместимости)
+QUERY_REWRITING_SOURCE=
+
+# === Если QUERY_REWRITING_SOURCE=openrouter ===
+# Требует: OPENAI_API_BASE, OPENAI_API_KEY, OPENAI_REWRITING_MODEL
+# Смотри раздел "QUERY REWRITING" ниже
+
+# === Если QUERY_REWRITING_SOURCE=ollama ===
+# Требует: USE_OLLAMA_FOR_QUERY_EXPANSION=true, OLLAMA_URL, OLLAMA_MODEL
+# Смотри раздел "QUERY REWRITING" ниже
+
+# Модель для Query Rewriting через OpenRouter
+# Если не указана, используется OPENAI_MODEL (из раздела "МОДЕЛЬ ЭМБЕДДИНГОВ")
+# ВАЖНО: Должна быть генеративная модель (chat/completion), а НЕ embedding!
+# Рекомендуется использовать одну из этих:
+#   - openai/gpt-3.5-turbo          (быстрая, недорогая, хорошее качество) ✓ РЕКОМЕНДУЕТСЯ
+#   - openai/gpt-4o-mini            (очень качественная, немного дороже)
+#   - qwen/qwen2.5-7b-instruct      (качественная, дешевая)
+#   - meta-llama/llama-3.1-8b-instruct (качественная, хороший баланс)
+OPENAI_REWRITING_MODEL=
+
+# TTL кэша переписей (секунды)
+# Кэширование результатов переписки в памяти для ускорения повторных запросов
+# По умолчанию: 3600 секунд (1 час)
+REWRITE_CACHE_TTL=3600
+
+# Ollama URL и модель для Query Rewriting
+# Используются если USE_OLLAMA_FOR_QUERY_EXPANSION=true
+# Если не указаны, используются значения из раздела "МОДЕЛЬ ЭМБЕДДИНГОВ"
+# OLLAMA_URL=http://ollama:11434  (уже определен выше)
+# OLLAMA_MODEL=llama3.2  (по умолчанию, можно переопределить)
+
+
+# ============================================
+# PARALLEL MULTI-QUERY SEARCH
+# ============================================
+# Параллельное выполнение поиска по вариантам запроса для ускорения (4x)
+
+# Включить параллельный поиск?
+# true = включен (рекомендуется, ускоряет поиск в 4 раза)
+# false = последовательный режим (старый способ)
+ENABLE_PARALLEL_SEARCH=true
+
+# Максимальное количество потоков для параллельного поиска
+# Рекомендуется: 4 (для большинства случаев)
+# Увеличьте если у вас мощный сервер и много вариантов запроса
+PARALLEL_SEARCH_MAX_WORKERS=4
+
+
+# ============================================
+# DIVERSITY FILTER (Настраиваемость)
+# ============================================
+# Ограничение количества chunks с одной страницы для разнообразия результатов
+
+# Включить Diversity Filter?
+# true = включен (рекомендуется, улучшает разнообразие результатов)
+# false = отключен (все результаты, даже с одной страницы)
+ENABLE_DIVERSITY_FILTER=true
+
+# Лимиты для разных типов запросов (максимум chunks с одной страницы)
+# Navigational (поиск конкретной информации): 1 chunk (показать больше страниц)
+DIVERSITY_LIMIT_NAVIGATIONAL=1
+
+# Exploratory (исследовательский поиск): 4 chunks (детальная информация)
+DIVERSITY_LIMIT_EXPLORATORY=4
+
+# Factual (фактический поиск): 2 chunks (стандартный лимит)
+DIVERSITY_LIMIT_FACTUAL=2
+
+# HowTo (инструкции): 3 chunks (детальная инструкция)
+DIVERSITY_LIMIT_HOWTO=3
+
+
+# ============================================
+# CONTEXT EXPANSION (Bidirectional + Related)
+# ============================================
+# Расширение контекста найденных результатов для улучшения релевантности
+
+# Включить Context Expansion?
+# true = включен (рекомендуется, улучшает качество результатов)
+# false = отключен (только оригинальные чанки)
+ENABLE_CONTEXT_EXPANSION=true
+
+# Режим расширения контекста
+# - bidirectional: ±N соседних чанков (рекомендуется, быстрый)
+# - related: похожие чанки на основе семантического сходства (медленнее, но точнее)
+# - parent: родительские разделы (экспериментальный)
+# - all: все режимы вместе (максимальный контекст, самый медленный)
+CONTEXT_EXPANSION_MODE=bidirectional
+
+# Размер контекста (количество chunks)
+# Для bidirectional: ±N chunks (например, 2 = ±2 chunks = 5 chunks всего)
+# Для related: количество похожих чанков
+CONTEXT_EXPANSION_SIZE=2
+

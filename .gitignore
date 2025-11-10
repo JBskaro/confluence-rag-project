@@ -1,0 +1,92 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+app.log
+
+# Database
+chroma_data/
+chroma_db/
+chroma_db_test/
+*.db
+*.sqlite
+*.sqlite3
+
+# Sync state
+sync_state.json
+data/sync_state.json
+
+# Data directory (cache, synonyms, logs)
+data/
+!data/.gitkeep
+
+# Model cache
+model_cache/
+
+# Backups
+backups/
+*.tar.gz
+*.bak
+*.backup
+
+# Docker
+# .dockerignore should be tracked in git
+
+# Test files
+test_*.py
+!tests/
+
+# Temporary files
+*.tmp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# MCP specific
+instruction/test_*.py
+
+# Archive directory (temporary files, old reports, analysis)
+archive/
+
+# Test data (temporary test files)
+test_data/
