@@ -30,6 +30,7 @@ ENV/
 # IDE
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 *~
@@ -90,3 +91,9 @@ archive/
 
 # Test data (temporary test files)
 test_data/
+
+# Scripts directory (utility scripts, not part of core project)
+scripts/
+
+# Tests directory (test files, not needed in production)
+tests/

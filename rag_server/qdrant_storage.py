@@ -1,0 +1,883 @@
+"""
+Qdrant vector store для хранения embeddings.
+Замена ChromaDB для лучшей масштабируемости.
+"""
+import os
+import logging
+import json
+import numpy as np
+from typing import List, Dict, Any, Optional, Tuple
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, Range, PayloadSchemaType
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from llama_index.core import StorageContext, VectorStoreIndex, Document
+
+# Инициализация logger (должен быть до использования)
+logger = logging.getLogger(__name__)
+
+def extract_text_from_payload(payload: Dict[str, Any]) -> str:
+    """
+    Извлечь текст из payload Qdrant.
+    
+    КРИТИЧНО: LlamaIndex QdrantVectorStore сохраняет текст в _node_content (JSON),
+    а не в поле 'text'. Эта функция проверяет оба варианта.
+    
+    Args:
+        payload: Payload из Qdrant точки
+        
+    Returns:
+        Текст документа или пустая строка
+    """
+    # Сначала проверяем прямое поле 'text'
+    text = payload.get('text', '')
+    if text:
+        return text
+    
+    # Если text пуст, пытаемся извлечь из _node_content (LlamaIndex формат)
+    node_content = payload.get('_node_content', '')
+    if node_content:
+        try:
+            node_data = json.loads(node_content)
+            text = node_data.get('text', '') or node_data.get('text_', '')
+            if text:
+                return text
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+    
+    return ''
+
+# Импорт MMR reranker (опционально, чтобы не ломать если модуль недоступен)
+try:
+    from mmr_reranker import mmr_rerank
+    HAS_MMR = True
+except ImportError:
+    try:
+        from rag_server.mmr_reranker import mmr_rerank
+        HAS_MMR = True
+    except ImportError:
+        HAS_MMR = False
+        logger.warning("MMR reranker not available (mmr_reranker module not found)")
+
+# Qdrant settings
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "confluence")
+
+qdrant_client = None
+vector_store = None
+index = None
+
+def init_qdrant_client() -> QdrantClient:
+    """Инициализировать Qdrant клиент."""
+    global qdrant_client
+    if qdrant_client is None:
+        try:
+            qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30)
+            logger.info(f"✅ Qdrant client initialized: {QDRANT_HOST}:{QDRANT_PORT}")
+        except Exception as e:
+            logger.error(f"Ошибка инициализации Qdrant client: {e}")
+            raise
+    return qdrant_client
+
+def init_qdrant_collection(embedding_dim: int) -> bool:
+    """
+    Инициализировать коллекцию Qdrant с индексами для метаданных.
+    
+    ИСПРАВЛЕНО: Добавлено создание payload индексов для быстрой фильтрации по метаданным.
+    """
+    client = init_qdrant_client()
+    
+    try:
+        collections = client.get_collections().collections
+        collection_names = [col.name for col in collections]
+        
+        collection_created = False
+        if QDRANT_COLLECTION not in collection_names:
+            client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config=VectorParams(
+                    size=embedding_dim,
+                    distance=Distance.COSINE
+                )
+            )
+            logger.info(f"✅ Created Qdrant collection: {QDRANT_COLLECTION} (dim={embedding_dim})")
+            collection_created = True
+        else:
+            # Проверяем размерность существующей коллекции
+            collection_info = client.get_collection(QDRANT_COLLECTION)
+            existing_dim = collection_info.config.params.vectors.size
+            if existing_dim != embedding_dim:
+                logger.error(
+                    f"Несовпадение размерности: Qdrant={existing_dim}D, Model={embedding_dim}D. "
+                    f"Удалите коллекцию {QDRANT_COLLECTION} и перезапустите."
+                )
+                return False
+            logger.info(f"✅ Qdrant collection exists: {QDRANT_COLLECTION} (dim={embedding_dim})")
+        
+        # Создаем payload индексы для быстрой фильтрации (если коллекция новая или индексов нет)
+        # Пытаемся создать индексы даже для существующей коллекции (если их еще нет)
+        try:
+            # Индексы для строковых полей (KEYWORD)
+            # ✅ ДОБАВЛЕНО: author, page_id для быстрой фильтрации
+            keyword_fields = ['space', 'status', 'type', 'content_type', 'created_by', 'modified_by', 'page_path', 'author', 'page_id']
+            for field in keyword_fields:
+                try:
+                    client.create_payload_index(
+                        collection_name=QDRANT_COLLECTION,
+                        field_name=field,
+                        field_schema=PayloadSchemaType.KEYWORD
+                    )
+                    logger.debug(f"✅ Created keyword index for {field}")
+                except Exception as e:
+                    # Индекс может уже существовать - это нормально
+                    if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                        logger.debug(f"Index for {field} already exists")
+                    else:
+                        logger.warning(f"Could not create index for {field}: {e}")
+            
+            # Индекс для labels (TEXT для поиска по подстроке)
+            try:
+                client.create_payload_index(
+                    collection_name=QDRANT_COLLECTION,
+                    field_name="labels",
+                    field_schema=PayloadSchemaType.TEXT
+                )
+                logger.debug("✅ Created text index for labels")
+            except Exception as e:
+                if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                    logger.debug("Index for labels already exists")
+                else:
+                    logger.warning(f"Could not create index for labels: {e}")
+            
+            # Индекс для headings (TEXT для поиска по заголовкам)
+            try:
+                client.create_payload_index(
+                    collection_name=QDRANT_COLLECTION,
+                    field_name="headings",
+                    field_schema=PayloadSchemaType.TEXT
+                )
+                logger.debug("✅ Created text index for headings")
+            except Exception as e:
+                if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                    logger.debug("Index for headings already exists")
+                else:
+                    logger.warning(f"Could not create index for headings: {e}")
+            
+            # ✅ ДОБАВЛЕНО: Индекс для title (TEXT для full-text search)
+            try:
+                client.create_payload_index(
+                    collection_name=QDRANT_COLLECTION,
+                    field_name="title",
+                    field_schema=PayloadSchemaType.TEXT
+                )
+                logger.debug("✅ Created text index for title")
+            except Exception as e:
+                if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                    logger.debug("Index for title already exists")
+                else:
+                    logger.warning(f"Could not create index for title: {e}")
+            
+            # Индексы для числовых полей (INTEGER)
+            # ✅ ДОБАВЛЕНО: created, modified для range queries
+            integer_fields = ['hierarchy_depth', 'version', 'children_count', 'heading_count', 'created', 'modified']
+            for field in integer_fields:
+                try:
+                    client.create_payload_index(
+                        collection_name=QDRANT_COLLECTION,
+                        field_name=field,
+                        field_schema=PayloadSchemaType.INTEGER
+                    )
+                    logger.debug(f"✅ Created integer index for {field}")
+                except Exception as e:
+                    if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                        logger.debug(f"Index for {field} already exists")
+                    else:
+                        logger.warning(f"Could not create index for {field}: {e}")
+            
+            if collection_created:
+                logger.info("✅ Created payload indexes for metadata filtering")
+            else:
+                logger.debug("✅ Verified payload indexes for metadata filtering")
+        except Exception as e:
+            logger.warning(f"Could not create some indexes (may already exist): {e}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка инициализации Qdrant collection: {e}")
+        return False
+
+def insert_chunk_to_qdrant(
+    client: QdrantClient,
+    chunk_text: str,
+    metadata: dict,
+    embedding: List[float],
+    point_id: str
+) -> bool:
+    """
+    Вставить один chunk в Qdrant напрямую (без llama-index).
+    
+    Args:
+        client: QdrantClient
+        chunk_text: Текст chunk
+        metadata: Метаданные chunk
+        embedding: Векторное представление текста
+        point_id: Уникальный ID точки (например: f"{page_id}_{chunk_idx}")
+    
+    Returns:
+        True если успешно, False если ошибка
+    """
+    try:
+        payload = {**metadata, "text": chunk_text}
+        point = PointStruct(
+            id=point_id,
+            vector=embedding,
+            payload=payload
+        )
+        client.upsert(
+            collection_name=QDRANT_COLLECTION,
+            points=[point]
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to insert chunk {point_id}: {e}")
+        return False
+
+def insert_chunks_batch_to_qdrant(
+    client: QdrantClient,
+    chunks_data: List[Dict[str, Any]],
+    batch_size: int = 100
+) -> Tuple[int, int]:
+    """
+    Вставить chunks батчами в Qdrant.
+    
+    Args:
+        client: QdrantClient
+        chunks_data: Список словарей с ключами: text, metadata, embedding, point_id
+        batch_size: Размер батча
+    
+    Returns:
+        Tuple[success_count, error_count]
+    """
+    success_count = 0
+    error_count = 0
+    
+    for i in range(0, len(chunks_data), batch_size):
+        batch = chunks_data[i:i + batch_size]
+        points = []
+        
+        for chunk in batch:
+            try:
+                payload = {**chunk['metadata'], "text": chunk['text']}
+                point = PointStruct(
+                    id=chunk['point_id'],
+                    vector=chunk['embedding'],
+                    payload=payload
+                )
+                points.append(point)
+            except Exception as e:
+                logger.warning(f"Error preparing point {chunk.get('point_id', 'unknown')}: {e}")
+                error_count += 1
+                continue
+        
+        if points:
+            try:
+                client.upsert(
+                    collection_name=QDRANT_COLLECTION,
+                    points=points
+                )
+                success_count += len(points)
+            except Exception as e:
+                logger.error(f"Error inserting batch {i//batch_size + 1}: {e}")
+                error_count += len(points)
+    
+    return success_count, error_count
+
+def get_qdrant_vector_store():
+    """Получить Qdrant vector store."""
+    global vector_store
+    if vector_store is None:
+        client = init_qdrant_client()
+        vector_store = QdrantVectorStore(
+            client=client,
+            collection_name=QDRANT_COLLECTION,
+            batch_size=100
+            # NOTE: Текст сохраняется через metadata['text'] в sync_confluence.py (lines 1537, 1799)
+        )
+    return vector_store
+
+
+def search_in_qdrant(
+    query_embedding: List[float],
+    limit: int = 10,
+    where_filter: Optional[Dict] = None,
+    # НОВЫЕ ОПЦИОНАЛЬНЫЕ ПАРАМЕТРЫ для metadata filtering:
+    space: Optional[str] = None,
+    author: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    status: Optional[str] = None,
+    content_type: Optional[str] = None,
+    labels: Optional[List[str]] = None,
+    # === НОВОЕ: ФИЛЬТР ПО ПУТИ ===
+    page_path: Optional[str] = None,  # "RAUII/Development/API"
+    # === НОВОЕ: ПОИСК В ЗАГОЛОВКАХ ===
+    search_headings: Optional[str] = None,  # Поиск query в заголовках
+    # === НОВОЕ: MMR DIVERSIFICATION ===
+    use_mmr: bool = False,  # Использовать MMR (default: false для обратной совместимости)
+    mmr_diversity_weight: float = 0.3  # Вес diversity (30%)
+) -> List[Dict[str, Any]]:
+    """
+    Поиск в Qdrant с поддержкой фильтрации по метаданным.
+    
+    ИСПРАВЛЕНО: Добавлены опциональные параметры для удобной фильтрации.
+    Если указаны параметры фильтрации, они автоматически преобразуются в where_filter.
+    
+    Args:
+        query_embedding: Vector embedding запроса
+        limit: Максимальное количество результатов
+        where_filter: Прямой фильтр Qdrant (если указан, остальные параметры игнорируются)
+        space: Фильтр по пространству (например, "RAUII")
+        author: Фильтр по автору (created_by)
+        from_date: Фильтр по дате создания >= (ISO format: "2025-01-01T00:00:00Z")
+        to_date: Фильтр по дате создания <= (ISO format)
+        status: Фильтр по статусу ("current", "archived", "draft")
+        content_type: Фильтр по типу ("page", "blogpost", "attachment")
+        labels: Фильтр по меткам (список строк, любая должна совпадать)
+        page_path: Фильтр по пути (например, "RAUII/Development/API")
+        search_headings: Поиск query в заголовках (текст для поиска)
+        use_mmr: Использовать MMR для диверсификации результатов
+        mmr_diversity_weight: Вес diversity для MMR (0-1), default 0.3
+    
+    Returns:
+        Список результатов поиска
+    """
+    client = init_qdrant_client()
+    
+    # Если указаны параметры фильтрации, строим Qdrant filter напрямую
+    qdrant_filter = None
+    must_conditions = []
+    
+    # Если указан where_filter, используем его (обратная совместимость)
+    if where_filter:
+        # Обрабатываем простой where_filter (dict с простыми значениями)
+        if isinstance(where_filter, dict):
+            # Обрабатываем формат {"must": [{"key": "...", "match": {...}}]}
+            if 'must' in where_filter:
+                must_list = where_filter.get('must', [])
+                for condition in must_list:
+                    if isinstance(condition, dict):
+                        key = condition.get('key')
+                        match_dict = condition.get('match', {})
+                        range_dict = condition.get('range', {})
+                        
+                        if key:
+                            if match_dict:
+                                # Обрабатываем match
+                                value = match_dict.get('value') or match_dict.get('text')
+                                if value:
+                                    must_conditions.append(
+                                        FieldCondition(
+                                            key=key,
+                                            match=MatchValue(value=value)
+                                        )
+                                    )
+                            elif range_dict:
+                                # Обрабатываем range
+                                if 'gte' in range_dict:
+                                    must_conditions.append(
+                                        FieldCondition(
+                                            key=key,
+                                            range=Range(gte=range_dict['gte'])
+                                        )
+                                    )
+                                elif 'lte' in range_dict:
+                                    must_conditions.append(
+                                        FieldCondition(
+                                            key=key,
+                                            range=Range(lte=range_dict['lte'])
+                                        )
+                                    )
+                                elif 'gt' in range_dict:
+                                    must_conditions.append(
+                                        FieldCondition(
+                                            key=key,
+                                            range=Range(gt=range_dict['gt'])
+                                        )
+                                    )
+                                elif 'lt' in range_dict:
+                                    must_conditions.append(
+                                        FieldCondition(
+                                            key=key,
+                                            range=Range(lt=range_dict['lt'])
+                                        )
+                                    )
+            elif '$and' in where_filter:
+                # Обрабатываем $and условия
+                for condition in where_filter['$and']:
+                    if isinstance(condition, dict):
+                        for key, value in condition.items():
+                            if isinstance(value, dict):
+                                # Обрабатываем операторы ($gte, $lte, etc.)
+                                if '$gte' in value:
+                                    must_conditions.append(
+                                        FieldCondition(
+                                            key=key,
+                                            range=Range(gte=value['$gte'])
+                                        )
+                                    )
+                                elif '$lte' in value:
+                                    must_conditions.append(
+                                        FieldCondition(
+                                            key=key,
+                                            range=Range(lte=value['$lte'])
+                                        )
+                                    )
+                                elif '$gt' in value:
+                                    must_conditions.append(
+                                        FieldCondition(
+                                            key=key,
+                                            range=Range(gt=value['$gt'])
+                                        )
+                                    )
+                                elif '$lt' in value:
+                                    must_conditions.append(
+                                        FieldCondition(
+                                            key=key,
+                                            range=Range(lt=value['$lt'])
+                                        )
+                                    )
+                            else:
+                                # Простое равенство
+                                must_conditions.append(
+                                    FieldCondition(
+                                        key=key,
+                                        match=MatchValue(value=value)
+                                    )
+                                )
+            else:
+                # Простой dict без $and
+                for key, value in where_filter.items():
+                    if isinstance(value, dict):
+                        # Обрабатываем операторы
+                        if '$gte' in value:
+                            must_conditions.append(
+                                FieldCondition(
+                                    key=key,
+                                    range=Range(gte=value['$gte'])
+                                )
+                            )
+                        elif '$lte' in value:
+                            must_conditions.append(
+                                FieldCondition(
+                                    key=key,
+                                    range=Range(lte=value['$lte'])
+                                )
+                            )
+                    else:
+                        must_conditions.append(
+                            FieldCondition(
+                                key=key,
+                                match=MatchValue(value=value)
+                            )
+                        )
+    
+    # Если указаны прямые параметры фильтрации, добавляем их
+    if space:
+        must_conditions.append(
+            FieldCondition(
+                key="space",
+                match=MatchValue(value=space)
+            )
+        )
+    
+    if author:
+        must_conditions.append(
+            FieldCondition(
+                key="created_by",
+                match=MatchValue(value=author)
+            )
+        )
+    
+    if status:
+        must_conditions.append(
+            FieldCondition(
+                key="status",
+                match=MatchValue(value=status)
+            )
+        )
+    
+    if content_type:
+        # Проверяем оба поля: 'type' (legacy) и 'content_type' (новое)
+        # В sync_confluence.py сохраняется как 'content_type', но может быть и 'type'
+        must_conditions.append(
+            FieldCondition(
+                key="content_type",
+                match=MatchValue(value=content_type)
+            )
+        )
+    
+    if from_date:
+        must_conditions.append(
+            FieldCondition(
+                key="created",
+                range=Range(gte=from_date)
+            )
+        )
+    
+    if to_date:
+        must_conditions.append(
+            FieldCondition(
+                key="created",
+                range=Range(lte=to_date)
+            )
+        )
+    
+    if labels:
+        # Для labels используем простую проверку (любая метка должна совпадать)
+        # В Qdrant это можно сделать через $or, но для простоты проверяем первую метку
+        # TODO: Реализовать полноценную OR логику для labels через should_conditions
+        if len(labels) > 0:
+            # Используем первую метку (для полной поддержки нужен более сложный фильтр с should)
+            # Labels хранятся как список, проверяем через contains
+            must_conditions.append(
+                FieldCondition(
+                    key="labels",
+                    match=MatchValue(value=labels[0])
+                )
+            )
+    
+    # === НОВОЕ: ФИЛЬТР ПО ПУТИ ===
+    if page_path:
+        must_conditions.append(
+            FieldCondition(
+                key="page_path",
+                match=MatchValue(value=page_path)
+            )
+        )
+    
+    # === НОВОЕ: ПОИСК В ЗАГОЛОВКАХ ===
+    if search_headings:
+        # Поиск query в поле headings
+        must_conditions.append(
+            FieldCondition(
+                key="headings",
+                match=MatchValue(value=search_headings)
+            )
+        )
+    
+    # Создаем Qdrant filter если есть условия
+    if must_conditions:
+        qdrant_filter = Filter(must=must_conditions)
+    
+    try:
+        # Для MMR нужны векторы результатов, поэтому получаем их если use_mmr=True
+        with_vectors = use_mmr and HAS_MMR
+        
+        # Если используем MMR, получаем больше результатов для диверсификации
+        search_limit = limit * 3 if (use_mmr and HAS_MMR) else limit
+        
+        results = client.search(
+            collection_name=QDRANT_COLLECTION,
+            query_vector=query_embedding,
+            limit=search_limit,
+            query_filter=qdrant_filter,
+            with_payload=True,  # КРИТИЧНО: Получаем payload с metadata!
+            with_vectors=with_vectors
+        )
+        
+        # Преобразуем в формат для MMR
+        formatted_results = []
+        for result in results:
+            result_dict = {
+                'id': str(result.id),
+                'score': result.score,
+                'payload': result.payload or {}
+            }
+            
+            # Добавляем embedding для MMR
+            if with_vectors and hasattr(result, 'vector') and result.vector:
+                result_dict['embedding'] = result.vector
+            elif with_vectors:
+                # Если вектор не получен, используем query_embedding как fallback
+                result_dict['embedding'] = query_embedding
+            
+            formatted_results.append(result_dict)
+        
+        # === НОВОЕ: MMR DIVERSIFICATION ===
+        if use_mmr and HAS_MMR and len(formatted_results) > limit:
+            logger.debug(f"🔀 Applying MMR diversification (weight={mmr_diversity_weight}, {len(formatted_results)} → {limit} results)")
+            
+            try:
+                # Проверяем что есть embeddings
+                if all('embedding' in r for r in formatted_results):
+                    formatted_results = mmr_rerank(
+                        query_embedding=np.array(query_embedding, dtype=np.float32),
+                        results=formatted_results,
+                        diversity_weight=mmr_diversity_weight,
+                        top_k=limit
+                    )
+                    logger.debug(f"✅ MMR diversification completed: {len(formatted_results)} results")
+                else:
+                    logger.warning("⚠️ Some results missing embeddings, skipping MMR, using top-K")
+                    formatted_results = formatted_results[:limit]
+            except Exception as e:
+                logger.warning(f"MMR failed, using top-K: {e}")
+                formatted_results = formatted_results[:limit]
+        else:
+            # Обрезаем до limit без MMR
+            formatted_results = formatted_results[:limit]
+        
+        return formatted_results
+    except Exception as e:
+        logger.error(f"Ошибка поиска в Qdrant: {e}")
+        return []
+
+def get_qdrant_count() -> int:
+    """Получить количество документов в Qdrant."""
+    client = init_qdrant_client()
+    try:
+        collection_info = client.get_collection(QDRANT_COLLECTION)
+        return collection_info.points_count
+    except Exception as e:
+        logger.error(f"Ошибка получения количества документов: {e}")
+        return 0
+
+def delete_points_by_page_id(page_id: str) -> bool:
+    """Удалить все точки (chunks) для страницы по page_id."""
+    client = init_qdrant_client()
+    try:
+        # Ищем все точки с данным page_id в payload
+        scroll_result = client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="page_id",
+                        match=MatchValue(value=page_id)
+                    )
+                ]
+            ),
+            limit=10000  # Максимум для удаления
+        )
+        
+        point_ids = [point.id for point in scroll_result[0]]
+        if point_ids:
+            client.delete(
+                collection_name=QDRANT_COLLECTION,
+                points_selector=point_ids
+            )
+            logger.debug(f"Удалено {len(point_ids)} точек для страницы {page_id}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка удаления точек для страницы {page_id}: {e}")
+        return False
+
+def delete_points_by_page_ids(page_ids: List[str], chunk_size: int = 500) -> int:
+    """
+    Удалить все точки (chunks) для списка страниц (batch operation с chunking).
+    
+    Оптимизация: один scroll запрос для chunk страниц вместо N запросов.
+    Для больших списков (>chunk_size) разбивает на chunks для избежания timeout.
+    
+    Args:
+        page_ids: Список page_id для удаления
+        chunk_size: Размер chunk для batch операции (по умолчанию 500)
+    
+    Returns:
+        Количество удаленных точек
+    """
+    if not page_ids:
+        return 0
+    
+    client = init_qdrant_client()
+    total_deleted = 0
+    
+    # Chunking для больших batch operations
+    for i in range(0, len(page_ids), chunk_size):
+        chunk = page_ids[i:i+chunk_size]
+        
+        try:
+            # Один scroll для chunk page_ids (OR условие)
+            scroll_result = client.scroll(
+                collection_name=QDRANT_COLLECTION,
+                scroll_filter=Filter(
+                    should=[  # OR условие для множественных page_ids
+                        FieldCondition(
+                            key="page_id",
+                            match=MatchValue(value=pid)
+                        )
+                        for pid in chunk
+                    ]
+                ),
+                limit=10000  # Максимум для удаления
+            )
+            
+            point_ids = [point.id for point in scroll_result[0]]
+            
+            if point_ids:
+                # Batch deletion
+                client.delete(
+                    collection_name=QDRANT_COLLECTION,
+                    points_selector=point_ids
+                )
+                total_deleted += len(point_ids)
+                logger.debug(
+                    f"Batch deletion chunk {i//chunk_size + 1}: "
+                    f"удалено {len(point_ids)} точек для {len(chunk)} страниц"
+                )
+        except Exception as e:
+            logger.error(
+                f"Ошибка batch deletion для chunk {i//chunk_size + 1} "
+                f"({len(chunk)} страниц): {e}"
+            )
+            continue
+    
+    if total_deleted > 0:
+        logger.info(
+            f"✅ Batch deletion завершено: удалено {total_deleted} точек "
+            f"для {len(page_ids)} страниц ({len(page_ids)//chunk_size + 1} chunks)"
+        )
+    
+    return total_deleted
+
+def get_all_points(limit: int = 10000, include_payload: bool = True) -> Dict[str, Any]:
+    """
+    Получить все точки из Qdrant (аналог collection.get() для ChromaDB).
+    
+    Args:
+        limit: Максимальное количество точек
+        include_payload: Включать ли payload (текст и метаданные)
+    
+    Returns:
+        Словарь в формате {'ids': [...], 'documents': [...], 'metadatas': [...]}
+    """
+    client = init_qdrant_client()
+    try:
+        scroll_result = client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            limit=limit,
+            with_payload=include_payload,
+            with_vectors=False
+        )
+        
+        points = scroll_result[0]
+        ids = []
+        documents = []
+        metadatas = []
+        
+        for point in points:
+            ids.append(str(point.id))
+            payload = point.payload or {}
+            
+            if include_payload:
+                # КРИТИЧНО: Используем функцию извлечения текста (поддерживает LlamaIndex формат)
+                text = extract_text_from_payload(payload)
+                documents.append(text)
+                # Метаданные - все кроме 'text' и '_node_content'
+                metadata = {k: v for k, v in payload.items() if k not in ('text', '_node_content')}
+                metadatas.append(metadata)
+        
+        return {
+            'ids': ids,
+            'documents': documents if include_payload else [],
+            'metadatas': metadatas if include_payload else []
+        }
+    except Exception as e:
+        logger.error(f"Ошибка получения всех точек из Qdrant: {e}")
+        return {'ids': [], 'documents': [], 'metadatas': []}
+
+def get_points_by_filter(filter_dict: Dict[str, Any], limit: int = 1000) -> Dict[str, Any]:
+    """
+    Получить точки по фильтру (аналог collection.get(where=...) для ChromaDB).
+    
+    Args:
+        filter_dict: Словарь с условиями фильтрации (например, {'page_id': '123'})
+        limit: Максимальное количество точек
+    
+    Returns:
+        Словарь в формате {'ids': [...], 'documents': [...], 'metadatas': [...]}
+    """
+    client = init_qdrant_client()
+    try:
+        # Преобразуем filter_dict в Qdrant Filter
+        conditions = []
+        for key, value in filter_dict.items():
+            if isinstance(value, dict):
+                # Поддержка операторов типа {'$gte': 0}
+                if '$gte' in value:
+                    conditions.append(
+                        FieldCondition(
+                            key=key,
+                            range=Range(gte=value['$gte'])
+                        )
+                    )
+                elif '$lte' in value:
+                    conditions.append(
+                        FieldCondition(
+                            key=key,
+                            range=Range(lte=value['$lte'])
+                        )
+                    )
+                elif '$and' in value:
+                    # Рекурсивная обработка $and
+                    and_conditions = []
+                    for and_item in value['$and']:
+                        for k, v in and_item.items():
+                            if isinstance(v, dict) and '$gte' in v:
+                                and_conditions.append(
+                                    FieldCondition(
+                                        key=k,
+                                        range=Range(gte=v['$gte'])
+                                    )
+                                )
+                            else:
+                                and_conditions.append(
+                                    FieldCondition(
+                                        key=k,
+                                        match=MatchValue(value=v)
+                                    )
+                                )
+                    conditions.extend(and_conditions)
+            else:
+                conditions.append(
+                    FieldCondition(
+                        key=key,
+                        match=MatchValue(value=value)
+                    )
+                )
+        
+        qdrant_filter = Filter(must=conditions) if conditions else None
+        
+        scroll_result = client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            scroll_filter=qdrant_filter,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False
+        )
+        
+        points = scroll_result[0]
+        ids = []
+        documents = []
+        metadatas = []
+        
+        for point in points:
+            ids.append(str(point.id))
+            payload = point.payload or {}
+            # КРИТИЧНО: Используем функцию извлечения текста (поддерживает LlamaIndex формат)
+            text = extract_text_from_payload(payload)
+            documents.append(text)
+            # Метаданные - все кроме 'text' и '_node_content'
+            metadata = {k: v for k, v in payload.items() if k not in ('text', '_node_content')}
+            metadatas.append(metadata)
+        
+        return {
+            'ids': ids,
+            'documents': documents,
+            'metadatas': metadatas
+        }
+    except Exception as e:
+        logger.error(f"Ошибка получения точек по фильтру из Qdrant: {e}")
+        return {'ids': [], 'documents': [], 'metadatas': []}
+

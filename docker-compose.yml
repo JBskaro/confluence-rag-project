@@ -5,8 +5,8 @@ services:
       dockerfile: Dockerfile.standalone
     container_name: confluence-rag
     volumes:
-      - ./chroma_data:/app/chroma_data
       - ./data:/app/data
+      # chroma_data больше не нужен - Qdrant работает в отдельном контейнере
     ports:
       - "8012:8012"
     networks:

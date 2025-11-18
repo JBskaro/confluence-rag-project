@@ -20,7 +20,8 @@ COPY rag_server/advanced_search.py advanced_search.py
 COPY rag_server/query_rewriter.py query_rewriter.py
 COPY rag_server/hybrid_search.py hybrid_search.py
 COPY rag_server/context_expansion.py context_expansion.py
-COPY rag_server/sync_confluence_optimized_final.py sync.py
+COPY rag_server/qdrant_storage.py qdrant_storage.py
+COPY rag_server/sync_confluence.py sync.py
 COPY rag_server/mcp_rag_secure.py server.py
 
 # Переменные окружения
@@ -29,9 +30,9 @@ ENV PYTHONIOENCODING=utf-8
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
-# Health check: проверяет MCP сервер И наличие данных в ChromaDB
+# Health check: проверяет MCP сервер
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
-    CMD python -c "import chromadb; c=chromadb.PersistentClient(path='./chroma_data'); coll=c.get_collection('confluence'); exit(0 if coll.count()>0 else 1)" 2>/dev/null || curl -f -H "Accept: application/json" http://localhost:8012/mcp || exit 0
+    CMD curl -f -H "Accept: application/json" http://localhost:8012/mcp || exit 0
 
 # Запуск sync и server
 # Модель инициализируется автоматически при импорте server.py (на уровне модуля)

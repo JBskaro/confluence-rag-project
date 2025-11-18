@@ -11,9 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastmcp import FastMCP
-from llama_index.core import VectorStoreIndex, StorageContext
-from llama_index.vector_stores.chroma import ChromaVectorStore
-import chromadb
+from qdrant_client import QdrantClient
 
 # Настройка логирования из ENV
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -28,13 +26,15 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 
-CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_data")
+# Qdrant configuration
+QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "confluence")
 # Импортируем унифицированный модуль embeddings
 from embeddings import (
     get_embed_model,
     generate_query_embedding,
     generate_query_embeddings_batch,
-    validate_collection_dimension,
     get_embedding_dimension,
     EMBED_MODEL,
     USE_OLLAMA,
@@ -127,7 +127,7 @@ def extract_keywords(query: str) -> list[str]:
     
     Args:
         query: Исходный запрос
-        
+    
     Returns:
         Список ключевых слов
     """
@@ -506,9 +506,9 @@ def expand_context_window(result: dict, window_size: int = 1) -> dict:
     Returns:
         Результат с расширенным контекстом
     """
-    global collection
+    global qdrant_client
     
-    if collection is None:
+    if qdrant_client is None:
         return result
     
     try:
@@ -530,16 +530,22 @@ def expand_context_window(result: dict, window_size: int = 1) -> dict:
         max_chunk = chunk_num + window_size
         
         # Получаем чанки в диапазоне
-        neighbors = collection.get(
-            where={
+        from qdrant_storage import get_points_by_filter
+        neighbors_raw = get_points_by_filter(
+            where_filter={
                 '$and': [
                     {'page_id': page_id},
                     {'chunk': {'$gte': min_chunk}},
                     {'chunk': {'$lte': max_chunk}}
                 ]
             },
-            include=['documents', 'metadatas']
+            limit=100,
+            collection=QDRANT_COLLECTION
         )
+        neighbors = {
+            'documents': [r.get('text', '') for r in neighbors_raw],
+            'metadatas': [r.get('metadata', {}) for r in neighbors_raw]
+        }
         
         # Безопасная проверка: neighbors может быть None или содержать None поля
         if (neighbors and 
@@ -711,7 +717,13 @@ def get_all_metadata_cached(collection: Any, ttl_seconds: int = 3600) -> Dict[st
     # Обновляем кэш
     logger.info("📊 Обновление metadata cache...")
     try:
-        all_data = collection.get(limit=10000, include=['metadatas'])
+        from qdrant_storage import get_all_points
+        all_points = get_all_points(limit=10000, include_payload=True, collection=QDRANT_COLLECTION)
+        # Преобразуем в ChromaDB формат
+        all_data = {
+            'ids': [p.get('id', '') for p in all_points.get('points', [])],
+            'metadatas': [p.get('metadata', {}) for p in all_points.get('points', [])]
+        }
         _metadata_cache = all_data
         _cache_timestamp = current_time
         _cache_ttl = ttl_seconds
@@ -844,7 +856,13 @@ def structural_metadata_search(
         max_scan = min(limit * 10, 10000)  # Не более 10K для производительности
         
         fetch_start = time.time()
-        all_data = collection.get(limit=max_scan, include=['documents', 'metadatas'])
+        from qdrant_storage import get_all_points
+        all_points = get_all_points(limit=max_scan, include_payload=True, collection=QDRANT_COLLECTION)
+        all_data = {
+            'ids': [p.get('id', '') for p in all_points.get('points', [])],
+            'documents': [p.get('text', '') for p in all_points.get('points', [])],
+            'metadatas': [p.get('metadata', {}) for p in all_points.get('points', [])]
+        }
         fetch_time = time.time() - fetch_start
         
         logger.debug(f"📊 Получено данных: {len(all_data.get('ids', []))} документов за {fetch_time:.3f}с")
@@ -1330,86 +1348,59 @@ def classify_query_intent(query: str) -> dict:
         'diversity': 2  # Стандартный лимит
     }
 
-def init_rag() -> Tuple[Any, StorageContext, VectorStoreIndex]:
+def init_rag() -> QdrantClient:
     """
-    Инициализация RAG системы: ChromaDB + LlamaIndex.
+    Инициализация RAG системы: Qdrant.
     
     Returns:
-        Tuple[Collection, StorageContext, VectorStoreIndex]
+        QdrantClient
     
     Raises:
         Exception: Если не удалось инициализировать компоненты
     """
     try:
-        logger.info(f"Инициализация ChromaDB: {CHROMA_PATH}")
-        client = chromadb.PersistentClient(path=CHROMA_PATH)
+        logger.info(f"Инициализация Qdrant: {QDRANT_HOST}:{QDRANT_PORT}, collection={QDRANT_COLLECTION}")
         
-        # Проверяем, существует ли коллекция
-        existing_collections = [col.name for col in client.list_collections()]
-        collection_exists = "confluence" in existing_collections
+        # Импортируем функции из qdrant_storage
+        from qdrant_storage import init_qdrant_client, init_qdrant_collection
         
-        if collection_exists:
-            collection = client.get_collection(name="confluence")
-        else:
-            collection = client.get_or_create_collection(
-                name="confluence", 
-                metadata={"hnsw:space": "cosine"}
-            )
+        # Инициализируем клиент
+        client = init_qdrant_client()
         
-        embed_model = get_embed_model()
+        # Получаем размерность embeddings
+        embedding_dim = get_embedding_dimension()
         
-        # Проверяем размерность embeddings в существующей базе
-        if collection_exists and collection.count() > 0:
-            is_valid, coll_dim, model_dim = validate_collection_dimension(collection)
-            if not is_valid:
-                logger.error(
-                    f"\n{'='*60}\n"
-                    f"⚠️  КРИТИЧЕСКАЯ ОШИБКА: НЕСОВПАДЕНИЕ РАЗМЕРНОСТИ\n"
-                    f"{'='*60}\n"
-                    f"ChromaDB содержит embeddings размерностью {coll_dim}D,\n"
-                    f"но модель {EMBED_MODEL} генерирует {model_dim}D векторы.\n\n"
-                    f"РЕШЕНИЕ:\n"
-                    f"1. Остановите контейнер: docker-compose down\n"
-                    f"2. Удалите старую базу: rm -rf ./chroma_data ./data/sync_state.json\n"
-                    f"3. Запустите заново: docker-compose up -d\n"
-                    f"{'='*60}\n"
-                )
-                raise ValueError(
-                    f"Dimension mismatch: ChromaDB={coll_dim}D, Model={model_dim}D. "
-                    f"Delete chroma_data directory and restart."
-                )
+        # Инициализируем коллекцию (создает если не существует)
+        success = init_qdrant_collection(embedding_dim)
+        if not success:
+            raise ValueError(f"Failed to initialize Qdrant collection: {QDRANT_COLLECTION}")
         
-        vector_store = ChromaVectorStore(chroma_collection=collection)
-        storage_context = StorageContext.from_defaults(vector_store=vector_store)
-        index = VectorStoreIndex.from_documents(
-            [], 
-            storage_context=storage_context, 
-            embed_model=embed_model
-        )
+        # Получаем количество документов
+        from qdrant_storage import get_qdrant_count
+        doc_count = get_qdrant_count(QDRANT_COLLECTION)
         
-        doc_count = collection.count()
-        model_dim = get_embedding_dimension()
-        logger.info(f"✅ RAG система готова. Документов: {doc_count}, Размерность: {model_dim}D")
-        return collection, storage_context, index
+        logger.info(f"✅ RAG система готова. Документов: {doc_count}, Размерность: {embedding_dim}D")
+        return client
         
     except Exception as e:
         logger.error(f"Критическая ошибка инициализации RAG: {e}")
         sys.exit(1)
 
-# Глобальные переменные для RAG компонентов
-collection = None
-storage_context = None
-index = None
+# Глобальная переменная для RAG компонента
+qdrant_client = None
 
 # Инициализация RAG при импорте модуля (до создания MCP сервера)
-# Это гарантирует, что модель загружается один раз при старте, а не при каждом запросе
+# Это гарантирует, что клиент инициализируется один раз при старте
 logger.info("Инициализация RAG при старте MCP сервера...")
-collection, storage_context, index = init_rag()
-logger.info(f"RAG система готова. Документов: {collection.count()}")
+qdrant_client = init_rag()
+from qdrant_storage import get_qdrant_count
+doc_count = get_qdrant_count(QDRANT_COLLECTION)
+logger.info(f"RAG система готова. Документов: {doc_count}")
 
 # Инициализация BM25 retriever для Hybrid Search (ленивая инициализация)
 logger.info("Инициализация BM25 retriever для Hybrid Search...")
-init_bm25_retriever(collection)
+# BM25 работает напрямую с Qdrant через qdrant_storage
+init_bm25_retriever(qdrant_client)
 
 # Предзагрузка reranker модели при старте (чтобы первый запрос был быстрее)
 logger.info("Предзагрузка reranker модели при старте...")
@@ -1442,54 +1433,35 @@ def execute_single_query_search(
         Список результатов поиска
     """
     try:
-        chroma_results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=search_limit,
-            where=where_filter,
-            include=['documents', 'metadatas', 'distances']
+        # Используем search_in_qdrant напрямую
+        from qdrant_storage import search_in_qdrant
+        
+        results_raw = search_in_qdrant(
+            query_embedding=query_embedding,
+            limit=search_limit,
+            where_filter=where_filter,
+            collection=QDRANT_COLLECTION
         )
         
         results = []
-        # Безопасная проверка: chroma_results может быть None или содержать None поля
-        if (chroma_results and 
-            chroma_results.get('ids') and 
-            chroma_results['ids'][0] and
-            chroma_results.get('documents') and
-            chroma_results['documents'][0] and
-            chroma_results.get('metadatas') and
-            chroma_results['metadatas'][0] and
-            chroma_results.get('distances') and
-            chroma_results['distances'][0]):
-            
-            for idx, doc_id in enumerate(chroma_results['ids'][0]):
-                # Дополнительная проверка на None для каждого элемента
-                doc_text = chroma_results['documents'][0][idx] if idx < len(chroma_results['documents'][0]) else None
-                doc_metadata = chroma_results['metadatas'][0][idx] if idx < len(chroma_results['metadatas'][0]) else None
-                doc_distance = chroma_results['distances'][0][idx] if idx < len(chroma_results['distances'][0]) else None
-                
-                if doc_text is not None and doc_metadata is not None:
-                    results.append({
-                        'id': doc_id,
-                        'text': doc_text,
-                        'metadata': doc_metadata if doc_metadata else {},
-                        'distance': doc_distance if doc_distance is not None else 0.0,
-                        'query_variant': query_text  # Сохраняем вариант запроса для отладки
-                    })
+        for result in results_raw:
+            doc_id = result.get('id', '')
+            if doc_id:
+                results.append({
+                    'id': doc_id,
+                    'text': result.get('text', ''),
+                    'metadata': result.get('metadata', {}),
+                    'distance': 1.0 - result.get('score', 0.0),
+                    'query_variant': query_text  # Сохраняем вариант запроса для отладки
+                })
         
         return results
         
     except Exception as e:
         error_msg = str(e)
-        if "hnsw segment reader" in error_msg.lower() or "nothing found on disk" in error_msg.lower():
-            logger.error(f"Ошибка ChromaDB при поиске '{query_text}': {error_msg}")
-            raise Exception(
-                f"Ошибка ChromaDB: база данных повреждена. "
-                f"Остановите контейнер, удалите chroma_data и переиндексируйте данные. "
-                f"Детали: {error_msg}"
-            )
-        else:
-            logger.warning(f"Ошибка при поиске '{query_text}': {e}")
-            return []  # Возвращаем пустой список вместо исключения
+        logger.error(f"Ошибка Qdrant при поиске '{query_text}': {error_msg}")
+        # Возвращаем пустой список вместо исключения для устойчивости
+        return []
 
 
 def parallel_multi_query_search(
@@ -1593,7 +1565,7 @@ def get_text_for_reranking(text: str, query: str, max_len: int = 1200) -> str:
         text: Полный текст документа
         query: Поисковый запрос
         max_len: Максимальная длина фрагмента (по умолчанию 1200 символов)
-        
+    
     Returns:
         Фрагмент текста с максимальным количеством ключевых слов
     """
@@ -1722,15 +1694,16 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
                 return "❌ Ошибка: Параметр space содержит недопустимые символы"
         
         # Проверка что RAG инициализирована при старте сервера
-        if collection is None or index is None:
+        if qdrant_client is None:
             return "❌ Ошибка: RAG система не инициализирована. Проверьте логи сервера."
         
         # Нормализация лимита
         limit = min(max(limit, 1), 20)
         
         # Проверка наличия документов
-        data = collection.get(limit=1)
-        if not data.get("ids"):
+        from qdrant_storage import get_qdrant_count
+        doc_count = get_qdrant_count(QDRANT_COLLECTION)
+        if doc_count == 0:
             logger.warning("Попытка поиска по пустому индексу")
             return "⚠️ Индекс пуст. Дождитесь завершения первой синхронизации."
         
@@ -1849,7 +1822,7 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
                 query_embeddings=query_embeddings,
                 search_limit=search_limit,
                 where_filter=where_filter,
-                collection=collection
+                collection=QDRANT_COLLECTION
             )
         except Exception as e:
             logger.error(f"Ошибка при параллельном поиске: {e}, fallback на последовательный режим")
@@ -1882,7 +1855,7 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
                     query_embeddings=query_embeddings,
                     search_limit=search_limit,
                     where_filter=where_filter,
-                    collection=collection
+                    collection=QDRANT_COLLECTION
                 )
                 # Добавляем только новые результаты
                 seen_ids = {r['id'] for r in all_results}
@@ -1895,7 +1868,7 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
                 seen_ids = {r['id'] for r in all_results}
                 for i, q in enumerate(expanded_queries):
                     results = execute_single_query_search(
-                        query_embeddings[i], q, search_limit, where_filter, collection
+                        query_embeddings[i], q, search_limit, where_filter, QDRANT_COLLECTION
                     )
                     for result in results:
                         if result['id'] not in seen_ids:
@@ -1917,39 +1890,30 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
                     # Генерируем embedding для расширенного запроса
                     prf_embedding = generate_query_embedding(expanded_query_prf)
                     
-                    # Повторный поиск
-                    chroma_results = collection.query(
-                        query_embeddings=[prf_embedding],
-                        n_results=search_limit,
-                        where=None,  # Без фильтров
-                        include=['documents', 'metadatas', 'distances']
+                    # Повторный поиск через Qdrant
+                    from qdrant_storage import search_in_qdrant
+                    qdrant_results = search_in_qdrant(
+                        query_embedding=prf_embedding,
+                        limit=search_limit,
+                        where_filter=None,  # Без фильтров
+                        collection=QDRANT_COLLECTION
                     )
                     
-                    # Безопасная проверка: chroma_results может быть None или содержать None поля
-                    if (chroma_results and 
-                        chroma_results.get('ids') and 
-                        chroma_results['ids'][0] and
-                        chroma_results.get('documents') and
-                        chroma_results['documents'][0] and
-                        chroma_results.get('metadatas') and
-                        chroma_results['metadatas'][0] and
-                        chroma_results.get('distances') and
-                        chroma_results['distances'][0]):
-                        for idx, doc_id in enumerate(chroma_results['ids'][0]):
-                            if doc_id not in seen_ids:
-                                seen_ids.add(doc_id)
-                                # Дополнительная проверка на None для каждого элемента
-                                doc_text = chroma_results['documents'][0][idx] if idx < len(chroma_results['documents'][0]) else None
-                                doc_metadata = chroma_results['metadatas'][0][idx] if idx < len(chroma_results['metadatas'][0]) else None
-                                doc_distance = chroma_results['distances'][0][idx] if idx < len(chroma_results['distances'][0]) else None
-                                
-                                if doc_text is not None and doc_metadata is not None:
-                                    all_results.append({
-                                        'id': doc_id,
-                                        'text': doc_text,
-                                        'metadata': doc_metadata if doc_metadata else {},
-                                        'distance': doc_distance if doc_distance is not None else 0.0
-                                    })
+                    # Обрабатываем результаты
+                    for result in qdrant_results:
+                        doc_id = result.get('id', '')
+                        if doc_id and doc_id not in seen_ids:
+                            seen_ids.add(doc_id)
+                            doc_text = result.get('text', '')
+                            doc_metadata = result.get('metadata', {})
+                            
+                            if doc_text:  # Проверяем, что текст не пустой
+                                all_results.append({
+                                    'id': doc_id,
+                                    'text': doc_text,
+                                    'metadata': doc_metadata,
+                                    'distance': 1.0 - result.get('score', 0.0)
+                                })
                     
                     if all_results:
                         fallback_message = fallback_search.get_fallback_message(2)
@@ -1967,37 +1931,30 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
                 # ОПТИМИЗАЦИЯ: Генерируем embedding только для keyword_query
                 keyword_embedding = generate_query_embedding(keyword_query)
                 
-                chroma_results = collection.query(
-                    query_embeddings=[keyword_embedding],
-                    n_results=search_limit,
-                    include=['documents', 'metadatas', 'distances']
+                # Поиск через Qdrant
+                from qdrant_storage import search_in_qdrant
+                qdrant_results = search_in_qdrant(
+                    query_embedding=keyword_embedding,
+                    limit=search_limit,
+                    where_filter=None,  # Без фильтров для keyword search
+                    collection=QDRANT_COLLECTION
                 )
                 
-                # Безопасная проверка: chroma_results может быть None или содержать None поля
-                if (chroma_results and 
-                    chroma_results.get('ids') and 
-                    chroma_results['ids'][0] and
-                    chroma_results.get('documents') and
-                    chroma_results['documents'][0] and
-                    chroma_results.get('metadatas') and
-                    chroma_results['metadatas'][0] and
-                    chroma_results.get('distances') and
-                    chroma_results['distances'][0]):
-                    for idx, doc_id in enumerate(chroma_results['ids'][0]):
-                        if doc_id not in seen_ids:
-                            seen_ids.add(doc_id)
-                            # Дополнительная проверка на None для каждого элемента
-                            doc_text = chroma_results['documents'][0][idx] if idx < len(chroma_results['documents'][0]) else None
-                            doc_metadata = chroma_results['metadatas'][0][idx] if idx < len(chroma_results['metadatas'][0]) else None
-                            doc_distance = chroma_results['distances'][0][idx] if idx < len(chroma_results['distances'][0]) else None
-                            
-                            if doc_text is not None and doc_metadata is not None:
-                                all_results.append({
-                                    'id': doc_id,
-                                    'text': doc_text,
-                                    'metadata': doc_metadata if doc_metadata else {},
-                                    'distance': doc_distance if doc_distance is not None else 0.0
-                                })
+                # Обрабатываем результаты
+                for result in qdrant_results:
+                    doc_id = result.get('id', '')
+                    if doc_id and doc_id not in seen_ids:
+                        seen_ids.add(doc_id)
+                        doc_text = result.get('text', '')
+                        doc_metadata = result.get('metadata', {})
+                        
+                        if doc_text:  # Проверяем, что текст не пустой
+                            all_results.append({
+                                'id': doc_id,
+                                'text': doc_text,
+                                'metadata': doc_metadata,
+                                'distance': 1.0 - result.get('score', 0.0)
+                            })
         
         if not all_results:
             return f"❌ Ничего не найдено по запросу: '{query}'"
@@ -2032,7 +1989,7 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
         try:
             all_results = hybrid_search(
                 query=query,
-                collection=collection,
+                collection=QDRANT_COLLECTION,
                 vector_results=all_results,
                 space_filter=space if space else None,
                 limit=search_limit * 2  # Берем больше для лучшего объединения
@@ -2280,7 +2237,7 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
                 if r and isinstance(r, dict):
                     expanded = expand_context_full(
                         r,
-                        collection=collection,
+                        collection=QDRANT_COLLECTION,
                         embeddings_model=embeddings_model,
                         expansion_mode=expansion_mode,
                         context_size=context_size
@@ -2512,19 +2469,24 @@ def confluence_search_by_label(label: str, limit: int = 5) -> str:
     """
     try:
         # Проверка что RAG инициализирована при старте сервера
-        if collection is None:
+        if qdrant_client is None:
             return "❌ Ошибка: RAG система не инициализирована. Проверьте логи сервера."
         
         limit = min(max(limit, 1), 20)
         
         # Проверка наличия документов
-        data = collection.get(limit=1)
-        if not data.get("ids"):
+        from qdrant_storage import get_qdrant_count, get_all_points
+        doc_count = get_qdrant_count(QDRANT_COLLECTION)
+        if doc_count == 0:
             return "⚠️ Индекс пуст. Дождитесь завершения первой синхронизации."
         
         # Получаем документы с разумным лимитом для предотвращения OOM
         MAX_SCAN_LIMIT = 10000  # Максимум документов для сканирования
-        all_data = collection.get(limit=MAX_SCAN_LIMIT)
+        all_points = get_all_points(limit=MAX_SCAN_LIMIT, include_payload=True, collection=QDRANT_COLLECTION)
+        all_data = {
+            'documents': [p.get('text', '') for p in all_points.get('points', [])],
+            'metadatas': [p.get('metadata', {}) for p in all_points.get('points', [])]
+        }
         scanned_count = len(all_data.get('metadatas', []))
         
         # Фильтруем по метке
@@ -2583,13 +2545,17 @@ def confluence_list_spaces() -> str:
         Список доступных пространств с количеством документов в каждом
     """
     try:
-        if collection is None:
+        if qdrant_client is None:
             return "❌ Ошибка: RAG система не инициализирована."
         
         # Получаем все уникальные пространства из метаданных
         # Используем разумный лимит для предотвращения OOM
         MAX_SCAN_LIMIT = 10000
-        all_data = collection.get(limit=MAX_SCAN_LIMIT, include=['metadatas'])
+        from qdrant_storage import get_all_points
+        all_points = get_all_points(limit=MAX_SCAN_LIMIT, include_payload=True, collection=QDRANT_COLLECTION)
+        all_data = {
+            'metadatas': [p.get('metadata', {}) for p in all_points.get('points', [])]
+        }
         spaces = {}
         
         for metadata in all_data.get('metadatas', []):
@@ -2623,15 +2589,18 @@ def confluence_health() -> str:
     """
     try:
         # Проверка что RAG инициализирована при старте сервера
-        if collection is None:
+        if qdrant_client is None:
             return "❌ Ошибка: RAG система не инициализирована. Проверьте логи сервера."
         
         # Подсчёт документов (используем count() для эффективности)
         try:
-            total_docs = collection.count()
+            from qdrant_storage import get_qdrant_count
+            total_docs = get_qdrant_count(QDRANT_COLLECTION)
         except Exception:
             # Fallback: оценка через ограниченную выборку
-            data = collection.get(limit=10)
+            from qdrant_storage import get_all_points
+            all_points = get_all_points(limit=10, include_payload=True, collection=QDRANT_COLLECTION)
+            data = {'points': all_points.get('points', [])}
             total_docs = len(data.get("ids", []))
             if total_docs == 10:
                 total_docs = "10+"  # Больше 10, точное число неизвестно
