@@ -1,13 +1,9 @@
 fastmcp>=0.2.0
-# llama-index используется только для sync (вставка документов), не для поиска
-llama-index-core>=0.10.0,<0.11.0
-llama-index-vector-stores-qdrant>=0.1.0,<0.2.0
-llama-index-embeddings-openai>=0.1.0
-llama-index-embeddings-huggingface>=0.2.0
-llama-index-embeddings-ollama>=0.1.0
-llama-index-retrievers-bm25>=0.1.0
+# LlamaIndex removed for optimization
+rank_bm25>=0.2.2
+langchain-text-splitters>=0.0.1
 qdrant-client>=1.7.0
-# chromadb>=0.4.0  # УДАЛЕНО: Мигрировали на Qdrant
+
 atlassian-python-api>=3.41.0
 html2text>=2020.1.16
 tenacity>=8.2.0
@@ -28,4 +24,11 @@ mypy>=1.7.0
 flake8>=6.1.0
 black>=23.12.0
 isort>=5.13.0
-beautifulsoup4>=4.12.0
+# Observability
+opentelemetry-api>=1.20.0
+opentelemetry-sdk>=1.20.0
+opentelemetry-exporter-otlp>=1.20.0
+opentelemetry-instrumentation-requests>=0.40b0
+prometheus-client>=0.17.0
+# Fix dependency hell with huggingface-hub 1.0+
+huggingface-hub>=0.23.0,<1.0.0

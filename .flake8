@@ -1,48 +1,24 @@
 [flake8]
-# Flake8 configuration для Confluence RAG project
-
-# Максимальная длина строки
+# Разумные лимиты для проекта
 max-line-length = 120
-
-# Игнорируемые ошибки
-ignore = 
-    # E203: whitespace before ':' (конфликтует с black)
-    E203,
-    # E501: line too long (black сам форматирует)
-    E501,
-    # W503: line break before binary operator (конфликтует с black)
-    W503,
-    # E402: module level import not at top of file (для conftest.py)
-    E402
-
-# Исключаемые файлы и директории
-exclude = 
-    .git,
-    __pycache__,
-    .venv,
-    venv,
-    build,
-    dist,
-    *.egg-info,
-    .eggs,
-    archive,
-    chroma_data,
-    htmlcov,
-    .pytest_cache,
-    .mypy_cache
-
-# Максимальная сложность функции
 max-complexity = 15
 
-# Исключаемые ошибки для конкретных файлов
-per-file-ignores =
-    __init__.py:F401
-    conftest.py:E402,F401
-    tests/*:E501
+# Игнорируем некритичные warnings
+ignore = 
+    E203,  # whitespace before ':'
+    W503,  # line break before binary operator
 
-# Статистика
+# Исключаем файлы
+exclude =
+    .git,
+    __pycache__,
+    venv,
+    .venv,
+    build,
+    dist,
+    *.egg-info
+
+# Показываем статистику
 statistics = True
-
-# Формат вывода
-format = default
-
+count = True
+show-source = True

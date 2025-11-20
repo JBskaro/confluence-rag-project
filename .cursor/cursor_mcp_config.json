@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "confluence-rag": {
+      "command": "python",
+      "args": ["-u", "C:\\MCP\\confluence-rag-project\\cursor_mcp_client.py"],
+      "env": {
+        "MCP_SERVER_URL": "http://localhost:8012/mcp"
+      }
+    }
+  }
+}
+

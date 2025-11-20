@@ -260,6 +260,29 @@ def cleanup_deleted_pages_postgres(current_page_ids: set) -> int:
         logger.error(f"Ошибка очистки удаленных страниц: {e}")
         return 0
 
+def clear_all_pages_postgres() -> int:
+    """
+    Полностью очистить таблицу confluence_pages (удалить все страницы).
+    
+    Returns:
+        Количество удаленных страниц
+    """
+    try:
+        with get_postgres_connection() as conn:
+            with conn.cursor() as cur:
+                # Получаем количество перед удалением
+                cur.execute("SELECT COUNT(*) FROM confluence_pages")
+                count = cur.fetchone()[0]
+                
+                # Удаляем все
+                cur.execute("TRUNCATE TABLE confluence_pages RESTART IDENTITY CASCADE")
+                conn.commit()
+                logger.info(f"✅ PostgreSQL очищен: удалено {count} страниц")
+                return count
+    except Exception as e:
+        logger.error(f"Ошибка очистки PostgreSQL: {e}")
+        return 0
+
 def get_postgres_stats() -> Dict[str, Any]:
     """Получить статистику PostgreSQL."""
     try:

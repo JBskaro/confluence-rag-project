@@ -6,586 +6,222 @@ Thread-safe кэширование моделей.
 import os
 import logging
 import threading
-from typing import Any, List, Optional
+import time
+from typing import List, Optional, Union, Any
 
-logger = logging.getLogger(__name__)
-
-# Отключаем избыточное логирование HTTP запросов от httpx/openai
+# Отключаем избыточное логирование
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
 
 # Конфигурация из ENV
 USE_OLLAMA = os.getenv("USE_OLLAMA", "false").lower() == "true"
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "ai-forever/FRIDA")
 
-# OpenAI-compatible API (для Ollama, LM Studio и др.)
-OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "")  # Например: http://localhost:11434/v1
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "ollama")  # Для Ollama обычно не нужен
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "")  # Имя модели для API
+# OpenAI-compatible API
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "ollama")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "")
 
-# Thread-safe кэширование модели с использованием Lock
+# Источник embeddings
+EMBEDDING_SOURCE = os.getenv('EMBEDDING_SOURCE', '').lower()
+
+# Thread-safe кэширование
 _model_lock = threading.Lock()
 _embed_model = None
-_embed_model_type = None  # 'openai', 'ollama', 'huggingface'
 
-def get_embed_model():
+
+class UnifiedEmbeddingModel:
     """
-    Получить инициализированную модель embeddings.
-    
-    Приоритет выбора модели (в порядке приоритета):
-    1. OpenAI-compatible API (если указан OPENAI_API_BASE) - для Ollama, LM Studio и др.
-    2. LlamaIndex Ollama (если USE_OLLAMA=true)
-    3. HuggingFace (локальная модель, по умолчанию)
-    
-    ВАЖНО: Если указана модель, она должна быть доступна. Нет автоматического fallback.
-    
-    Модель кэшируется глобально и создается только один раз.
-    
-    Returns:
-        Embedding model instance
-    
-    Raises:
-        RuntimeError: Если указанная модель недоступна
-        ImportError: Если не установлены необходимые пакеты
+    Унифицированный класс для работы с различными моделями embeddings.
+    Заменяет LlamaIndex BaseEmbedding.
     """
-    global _embed_model, _embed_model_type
-    
-    # ========================================
-    # НОВАЯ ЛОГИКА: Выбор источника по EMBEDDING_SOURCE
-    # ========================================
-    embedding_source = os.getenv('EMBEDDING_SOURCE', '').lower()
-    
-    if embedding_source:
-        logger.info(f"🔄 EMBEDDING_SOURCE={embedding_source} (explicit selection)")
+    def __init__(self, source: str, model_name: str, dimension: int, client: Any = None):
+        self.source = source
+        self.model_name = model_name
+        self._dimension = dimension
+        self.client = client
+
+    def get_query_embedding(self, query: str) -> List[float]:
+        """Генерация embedding для запроса."""
+        return self._generate_embedding(query)
+
+    def get_text_embedding(self, text: str) -> List[float]:
+        """Генерация embedding для текста."""
+        return self._generate_embedding(text)
+
+    def _generate_embedding(self, text: str) -> List[float]:
+        """Внутренний метод генерации."""
+        if not text:
+            return [0.0] * self._dimension
+
+        try:
+            if self.source in ('openai', 'openrouter', 'ollama'):
+                # Используем OpenAI client
+                text = text.replace("\n", " ")
+                response = self.client.embeddings.create(
+                    model=self.model_name,
+                    input=[text]
+                )
+                return response.data[0].embedding
+            
+            elif self.source == 'huggingface':
+                # Используем SentenceTransformer
+                embedding = self.client.encode(text, normalize_embeddings=False)
+                return embedding.tolist()
+            
+            else:
+                raise ValueError(f"Unknown source: {self.source}")
+                
+        except Exception as e:
+            logger.error(f"Error generating embedding ({self.source}): {e}")
+            # Возвращаем нулевой вектор в случае ошибки, чтобы не ронять процесс
+            # (хотя лучше бы рейзить, но для надежности оставим так или добавим retry)
+            raise e
+
+    def get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Batch генерация embeddings."""
+        if not texts:
+            return []
+
+        try:
+            if self.source in ('openai', 'openrouter', 'ollama'):
+                # OpenAI поддерживает batch
+                cleaned_texts = [t.replace("\n", " ") for t in texts]
+                response = self.client.embeddings.create(
+                    model=self.model_name,
+                    input=cleaned_texts
+                )
+                # Гарантируем порядок
+                return [item.embedding for item in response.data]
+            
+            elif self.source == 'huggingface':
+                # SentenceTransformer поддерживает batch
+                embeddings = self.client.encode(texts, normalize_embeddings=False)
+                return [emb.tolist() for emb in embeddings]
+            
+            else:
+                return [self._generate_embedding(t) for t in texts]
+                
+        except Exception as e:
+            logger.error(f"Error generating batch embeddings: {e}")
+            # Fallback to sequential
+            return [self._generate_embedding(t) for t in texts]
+
+    def get_embedding_dimension(self) -> int:
+        return self._dimension
         
-        # Если модель уже загружена с другим источником - нужно перезагрузить
-        if _embed_model is not None and _embed_model_type != embedding_source:
-            logger.warning(f"⚠️ Model already loaded with type {_embed_model_type}, reloading for {embedding_source}")
-            _embed_model = None
-            _embed_model_type = None
-    else:
-        logger.debug("ℹ️ EMBEDDING_SOURCE not specified, using legacy logic (priority order)")
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+
+def get_embed_model() -> UnifiedEmbeddingModel:
+    """
+    Фабрика для получения модели embeddings.
+    """
+    global _embed_model
     
-    # Double-check locking pattern для thread-safety
-    if _embed_model is None:
-        with _model_lock:
-            # Повторная проверка внутри lock (другой поток мог уже загрузить)
-            if _embed_model is None:
-                import time
-                start_time = time.time()
+    if _embed_model:
+        return _embed_model
+
+    with _model_lock:
+        if _embed_model:
+            return _embed_model
+            
+        start_time = time.time()
+        source = EMBEDDING_SOURCE
+        
+        # Логика выбора источника (совместимость с legacy)
+        if not source:
+            if OPENAI_API_BASE:
+                source = 'openai'
+            elif USE_OLLAMA:
+                source = 'ollama'
+            else:
+                source = 'huggingface'
+        
+        logger.info(f"Initializing embedding model. Source: {source}")
+
+        try:
+            if source == 'openrouter' or source == 'openai':
+                from openai import OpenAI
                 
-                # ========== ВАРИАНТ 1: OpenRouter (если EMBEDDING_SOURCE=openrouter) ==========
-                if embedding_source == 'openrouter':
-                    if not OPENAI_API_BASE or not OPENAI_API_KEY or not OPENAI_MODEL:
-                        raise ValueError(
-                            "EMBEDDING_SOURCE=openrouter requires: "
-                            "OPENAI_API_BASE, OPENAI_API_KEY, OPENAI_MODEL"
-                        )
-                    # Используем существующий код для OpenAI-compatible API
-                    try:
-                        from openai import OpenAI
-                        from llama_index.core.embeddings import BaseEmbedding
-                        
-                        api_base = OPENAI_API_BASE.rstrip('/')
-                        if not api_base.endswith('/v1'):
-                            api_base = f"{api_base}/v1"
-                        
-                        model_name = OPENAI_MODEL or EMBED_MODEL
-                        
-                        logger.info(f"🔌 Попытка подключения к OpenAI-compatible API: {api_base}")
-                        logger.info(f"   Модель: {model_name}")
-                        
-                        client = OpenAI(base_url=api_base, api_key=OPENAI_API_KEY or None)
-                        
-                        # Тестовая проверка подключения
-                        test_response = client.embeddings.create(
-                            model=model_name,
-                            input=["test"]
-                        )
-                        
-                        # Определяем размерность
-                        test_dim = len(test_response.data[0].embedding)
-                        
-                        # Создаем кастомный класс, наследующийся от BaseEmbedding
-                        class CustomOpenAIEmbedding(BaseEmbedding):
-                            def __init__(self, client, model_name, dimension):
-                                # BaseEmbedding использует Pydantic, нужно вызывать super().__init__() без параметров
-                                super().__init__()
-                                # Сохраняем параметры как приватные атрибуты (не Pydantic поля)
-                                self._client = client
-                                self._model_name = model_name
-                                self._dimension = dimension
-                            
-                            def _get_query_embedding(self, query: str) -> List[float]:
-                                response = self._client.embeddings.create(
-                                    model=self._model_name,
-                                    input=[query]
-                                )
-                                return response.data[0].embedding
-                            
-                            async def _aget_query_embedding(self, query: str) -> List[float]:
-                                # Асинхронная версия (используем синхронный клиент)
-                                return self._get_query_embedding(query)
-                            
-                            def _get_text_embedding(self, text: str) -> List[float]:
-                                return self._get_query_embedding(text)
-                            
-                            async def _aget_text_embedding(self, text: str) -> List[float]:
-                                return self._get_text_embedding(text)
-                            
-                            def _get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
-                                response = self._client.embeddings.create(
-                                    model=self._model_name,
-                                    input=texts
-                                )
-                                return [item.embedding for item in response.data]
-                            
-                            async def _aget_text_embeddings(self, texts: List[str]) -> List[List[float]]:
-                                return self._get_text_embeddings(texts)
-                            
-                            @property
-                            def dimension(self) -> int:
-                                return self._dimension
-                            
-                            def get_embedding_dimension(self) -> int:
-                                """Метод для совместимости с get_embedding_dimension()."""
-                                return self._dimension
-                        
-                        _embed_model = CustomOpenAIEmbedding(client, model_name, test_dim)
-                        _embed_model_type = 'openai'
-                        
-                        elapsed = time.time() - start_time
-                        logger.info(f"✅ OpenAI-compatible API подключен за {elapsed:.1f} сек")
-                        logger.info(f"   Модель: {model_name}, Размерность: {test_dim}D")
-                        return _embed_model
-                        
-                    except ImportError as import_err:
-                        error_msg = (
-                            f"❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось импортировать необходимые модули\n"
-                            f"   Ошибка: {import_err}\n"
-                            f"   Установите: pip install openai llama-index"
-                        )
-                        logger.error(error_msg)
-                        raise RuntimeError(error_msg)
-                    except Exception as api_error:
-                        error_msg = (
-                            f"❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось подключиться к OpenAI-compatible API\n"
-                            f"   URL: {OPENAI_API_BASE}\n"
-                            f"   Модель: {model_name}\n"
-                            f"   Ошибка: {api_error}\n\n"
-                            f"   РЕШЕНИЕ:\n"
-                            f"   1. Проверьте URL: {OPENAI_API_BASE}\n"
-                            f"   2. Проверьте API ключ: {OPENAI_API_KEY[:10] if OPENAI_API_KEY else 'не указан'}...\n"
-                            f"   3. Проверьте имя модели: {model_name}"
-                        )
-                        logger.error(error_msg)
-                        raise RuntimeError(error_msg)
+                api_base = OPENAI_API_BASE
+                if not api_base and source == 'openrouter':
+                    api_base = "https://openrouter.ai/api/v1"
                 
-                # ========== ВАРИАНТ 2: Ollama (если EMBEDDING_SOURCE=ollama) ==========
-                elif embedding_source == 'ollama':
-                    ollama_url = os.getenv('OLLAMA_URL', 'http://localhost:11434')
-                    ollama_model = os.getenv('OLLAMA_EMBEDDING_MODEL') or os.getenv('OLLAMA_MODEL') or EMBED_MODEL
+                if api_base and not api_base.endswith('/v1'):
+                    api_base = f"{api_base}/v1"
                     
-                    if not ollama_url:
-                        raise ValueError("EMBEDDING_SOURCE=ollama requires: OLLAMA_URL")
-                    
-                    # Используем существующий код для Ollama
-                    # ========== ПРИОРИТЕТ 2: LlamaIndex Ollama ==========
-                    try:
-                        from llama_index.embeddings.ollama import OllamaEmbedding
-                        logger.info(f"🔌 Попытка подключения к Ollama: {ollama_model} @ {ollama_url}")
-                        _embed_model = OllamaEmbedding(model_name=ollama_model, base_url=ollama_url)
-                        
-                        # Тестовая проверка
-                        test_embedding = _embed_model.get_text_embedding("test")
-                        _embed_model_type = 'ollama'
-                        
-                        elapsed = time.time() - start_time
-                        logger.info(f"✅ Ollama подключен за {elapsed:.1f} сек")
-                        logger.info(f"   Модель: {ollama_model}, Размерность: {len(test_embedding)}D")
-                        return _embed_model
-                        
-                    except ImportError:
-                        error_msg = (
-                            f"❌ КРИТИЧЕСКАЯ ОШИБКА: llama-index-embeddings-ollama не установлен\n"
-                            f"   Установите: pip install llama-index-embeddings-ollama"
-                        )
-                        logger.error(error_msg)
-                        raise RuntimeError(error_msg)
-                    except Exception as ollama_error:
-                        error_msg = (
-                            f"❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось подключиться к Ollama\n"
-                            f"   URL: {ollama_url}\n"
-                            f"   Модель: {ollama_model}\n"
-                            f"   Ошибка: {ollama_error}\n\n"
-                            f"   РЕШЕНИЕ:\n"
-                            f"   1. Убедитесь, что Ollama запущен: ollama serve\n"
-                            f"   2. Проверьте URL: {ollama_url}\n"
-                            f"   3. Установите модель: ollama pull {ollama_model}"
-                        )
-                        logger.error(error_msg)
-                        raise RuntimeError(error_msg)
+                api_key = OPENAI_API_KEY
+                model_name = OPENAI_MODEL or EMBED_MODEL
                 
-                # ========== ВАРИАНТ 3: HuggingFace (если EMBEDDING_SOURCE=huggingface) ==========
-                elif embedding_source == 'huggingface':
-                    # Используем существующий код для HuggingFace
-                    # ========== ПРИОРИТЕТ 3: HuggingFace (по умолчанию, если ничего не указано) ==========
-                    try:
-                        from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-                        logger.info(f"📦 Загрузка HuggingFace embeddings: {EMBED_MODEL}")
-                        logger.info("   (~1.5GB, может занять 30-90 сек)")
-                        _embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
-                        _embed_model_type = 'huggingface'
-                        
-                        elapsed = time.time() - start_time
-                        logger.info(f"✅ HuggingFace модель загружена за {elapsed:.1f} сек")
-                        logger.info(f"   Модель: {EMBED_MODEL}")
-                        return _embed_model
-                        
-                    except ImportError as e:
-                        error_msg = (
-                            f"❌ КРИТИЧЕСКАЯ ОШИБКА: llama-index-embeddings-huggingface не установлен\n"
-                            f"   Установите: pip install llama-index-embeddings-huggingface"
-                        )
-                        logger.error(error_msg)
-                        raise RuntimeError(error_msg)
-                    except Exception as e:
-                        error_msg = (
-                            f"❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось загрузить HuggingFace модель\n"
-                            f"   Модель: {EMBED_MODEL}\n"
-                            f"   Ошибка: {e}"
-                        )
-                        logger.error(error_msg)
-                        import traceback
-                        logger.error(f"Traceback: {traceback.format_exc()}")
-                        raise RuntimeError(error_msg)
+                client = OpenAI(base_url=api_base, api_key=api_key)
                 
-                # ========== LEGACY: Старая логика (если EMBEDDING_SOURCE не указан) ==========
-                elif embedding_source == '':
-                    logger.info("ℹ️ EMBEDDING_SOURCE not specified, using legacy logic (priority order)")
-                    
-                    # ========== ПРИОРИТЕТ 1: OpenAI-compatible API ==========
-                    if OPENAI_API_BASE:
-                        try:
-                            from openai import OpenAI
-                            from llama_index.core.embeddings import BaseEmbedding
-                            
-                            api_base = OPENAI_API_BASE.rstrip('/')
-                            if not api_base.endswith('/v1'):
-                                api_base = f"{api_base}/v1"
-                            
-                            model_name = OPENAI_MODEL or EMBED_MODEL
-                            
-                            logger.info(f"🔌 Попытка подключения к OpenAI-compatible API: {api_base}")
-                            logger.info(f"   Модель: {model_name}")
-                            
-                            client = OpenAI(base_url=api_base, api_key=OPENAI_API_KEY or None)
-                            
-                            # Тестовая проверка подключения
-                            test_response = client.embeddings.create(
-                                model=model_name,
-                                input=["test"]
-                            )
-                            
-                            # Определяем размерность
-                            test_dim = len(test_response.data[0].embedding)
-                            
-                            # Создаем кастомный класс, наследующийся от BaseEmbedding
-                            class CustomOpenAIEmbedding(BaseEmbedding):
-                                def __init__(self, client, model_name, dimension):
-                                    super().__init__()
-                                    self._client = client
-                                    self._model_name = model_name
-                                    self._dimension = dimension
-                                
-                                def _get_query_embedding(self, query: str) -> List[float]:
-                                    response = self._client.embeddings.create(
-                                        model=self._model_name,
-                                        input=[query]
-                                    )
-                                    return response.data[0].embedding
-                                
-                                async def _aget_query_embedding(self, query: str) -> List[float]:
-                                    return self._get_query_embedding(query)
-                                
-                                def _get_text_embedding(self, text: str) -> List[float]:
-                                    return self._get_query_embedding(text)
-                                
-                                async def _aget_text_embedding(self, text: str) -> List[float]:
-                                    return self._get_text_embedding(text)
-                                
-                                def _get_text_embeddings(self, texts: List[str]) -> List[List[float]]:
-                                    response = self._client.embeddings.create(
-                                        model=self._model_name,
-                                        input=texts
-                                    )
-                                    return [item.embedding for item in response.data]
-                                
-                                async def _aget_text_embeddings(self, texts: List[str]) -> List[List[float]]:
-                                    return self._get_text_embeddings(texts)
-                                
-                                @property
-                                def dimension(self) -> int:
-                                    return self._dimension
-                                
-                                def get_embedding_dimension(self) -> int:
-                                    return self._dimension
-                            
-                            _embed_model = CustomOpenAIEmbedding(client, model_name, test_dim)
-                            _embed_model_type = 'openai'
-                            
-                            elapsed = time.time() - start_time
-                            logger.info(f"✅ OpenAI-compatible API подключен за {elapsed:.1f} сек")
-                            logger.info(f"   Модель: {model_name}, Размерность: {test_dim}D")
-                            return _embed_model
-                            
-                        except ImportError as import_err:
-                            error_msg = (
-                                f"❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось импортировать необходимые модули\n"
-                                f"   Ошибка: {import_err}\n"
-                                f"   Установите: pip install openai llama-index"
-                            )
-                            logger.error(error_msg)
-                            raise RuntimeError(error_msg)
-                        except Exception as api_error:
-                            error_msg = (
-                                f"❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось подключиться к OpenAI-compatible API\n"
-                                f"   URL: {OPENAI_API_BASE}\n"
-                                f"   Модель: {model_name}\n"
-                                f"   Ошибка: {api_error}\n\n"
-                                f"   РЕШЕНИЕ:\n"
-                                f"   1. Проверьте URL: {OPENAI_API_BASE}\n"
-                                f"   2. Проверьте API ключ: {OPENAI_API_KEY[:10] if OPENAI_API_KEY else 'не указан'}...\n"
-                                f"   3. Проверьте имя модели: {model_name}"
-                            )
-                            logger.error(error_msg)
-                            raise RuntimeError(error_msg)
-                    
-                    # ========== ПРИОРИТЕТ 2: LlamaIndex Ollama ==========
-                    if USE_OLLAMA:
-                        try:
-                            from llama_index.embeddings.ollama import OllamaEmbedding
-                            logger.info(f"🔌 Попытка подключения к Ollama: {EMBED_MODEL} @ {OLLAMA_URL}")
-                            _embed_model = OllamaEmbedding(model_name=EMBED_MODEL, base_url=OLLAMA_URL)
-                            
-                            # Тестовая проверка
-                            test_embedding = _embed_model.get_text_embedding("test")
-                            _embed_model_type = 'ollama'
-                            
-                            elapsed = time.time() - start_time
-                            logger.info(f"✅ Ollama подключен за {elapsed:.1f} сек")
-                            logger.info(f"   Модель: {EMBED_MODEL}, Размерность: {len(test_embedding)}D")
-                            return _embed_model
-                            
-                        except ImportError:
-                            error_msg = (
-                                f"❌ КРИТИЧЕСКАЯ ОШИБКА: llama-index-embeddings-ollama не установлен\n"
-                                f"   Установите: pip install llama-index-embeddings-ollama"
-                            )
-                            logger.error(error_msg)
-                            raise RuntimeError(error_msg)
-                        except Exception as ollama_error:
-                            error_msg = (
-                                f"❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось подключиться к Ollama\n"
-                                f"   URL: {OLLAMA_URL}\n"
-                                f"   Модель: {EMBED_MODEL}\n"
-                                f"   Ошибка: {ollama_error}\n\n"
-                                f"   РЕШЕНИЕ:\n"
-                                f"   1. Убедитесь, что Ollama запущен: ollama serve\n"
-                                f"   2. Проверьте URL: {OLLAMA_URL}\n"
-                                f"   3. Установите модель: ollama pull {EMBED_MODEL}"
-                            )
-                            logger.error(error_msg)
-                            raise RuntimeError(error_msg)
-                    
-                    # ========== ПРИОРИТЕТ 3: HuggingFace (по умолчанию, если ничего не указано) ==========
-                    try:
-                        from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-                        logger.info(f"📦 Загрузка HuggingFace embeddings: {EMBED_MODEL}")
-                        logger.info("   (~1.5GB, может занять 30-90 сек)")
-                        _embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
-                        _embed_model_type = 'huggingface'
-                        
-                        elapsed = time.time() - start_time
-                        logger.info(f"✅ HuggingFace модель загружена за {elapsed:.1f} сек")
-                        logger.info(f"   Модель: {EMBED_MODEL}")
-                        return _embed_model
-                        
-                    except ImportError as e:
-                        error_msg = (
-                            f"❌ КРИТИЧЕСКАЯ ОШИБКА: llama-index-embeddings-huggingface не установлен\n"
-                            f"   Установите: pip install llama-index-embeddings-huggingface"
-                        )
-                        logger.error(error_msg)
-                        raise RuntimeError(error_msg)
-                    except Exception as e:
-                        error_msg = (
-                            f"❌ КРИТИЧЕСКАЯ ОШИБКА: Не удалось загрузить HuggingFace модель\n"
-                            f"   Модель: {EMBED_MODEL}\n"
-                            f"   Ошибка: {e}"
-                        )
-                        logger.error(error_msg)
-                        import traceback
-                        logger.error(f"Traceback: {traceback.format_exc()}")
-                        raise RuntimeError(error_msg)
+                # Test & get dimension
+                logger.info(f"Testing connection to {api_base} with model {model_name}...")
+                resp = client.embeddings.create(model=model_name, input=["test"])
+                dim = len(resp.data[0].embedding)
                 
-                else:
-                    raise ValueError(
-                        f"Unknown EMBEDDING_SOURCE: {embedding_source}. "
-                        f"Use: 'openrouter', 'ollama', 'huggingface' or leave empty for legacy logic"
-                    )
-    
-    return _embed_model
+                _embed_model = UnifiedEmbeddingModel(source, model_name, dim, client)
+                
+            elif source == 'ollama':
+                # Ollama совместима с OpenAI API
+                from openai import OpenAI
+                
+                api_base = OLLAMA_URL
+                if not api_base.endswith('/v1'):
+                    api_base = f"{api_base}/v1"
+                    
+                model_name = os.getenv('OLLAMA_EMBEDDING_MODEL') or os.getenv('OLLAMA_MODEL') or EMBED_MODEL
+                
+                client = OpenAI(base_url=api_base, api_key="ollama")
+                
+                logger.info(f"Testing connection to Ollama at {api_base} with model {model_name}...")
+                resp = client.embeddings.create(model=model_name, input=["test"])
+                dim = len(resp.data[0].embedding)
+                
+                _embed_model = UnifiedEmbeddingModel(source, model_name, dim, client)
+                
+            elif source == 'huggingface':
+                from sentence_transformers import SentenceTransformer
+                
+                logger.info(f"Loading HuggingFace model: {EMBED_MODEL}...")
+                client = SentenceTransformer(EMBED_MODEL)
+                dim = client.get_sentence_embedding_dimension()
+                
+                _embed_model = UnifiedEmbeddingModel(source, EMBED_MODEL, dim, client)
+                
+            else:
+                raise ValueError(f"Unsupported embedding source: {source}")
+                
+            elapsed = time.time() - start_time
+            logger.info(f"✅ Embedding model initialized in {elapsed:.2f}s. Dimension: {_embed_model.dimension}")
+            return _embed_model
+
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize embedding model: {e}")
+            raise RuntimeError(f"Failed to initialize embedding model: {e}")
+
 
 def get_embedding_dimension() -> int:
-    """
-    Получить размерность embeddings текущей модели.
-    
-    Returns:
-        int: Размерность вектора embeddings
-    """
-    global _embed_model_type
-    
+    """Helper to get dimension."""
     model = get_embed_model()
-    
-    if _embed_model_type == 'openai':
-        # OpenAI-compatible API: используем сохраненную размерность
-        return model.get_embedding_dimension()
-    elif _embed_model_type == 'ollama':
-        # Для Ollama нужно сделать тестовый запрос
-        test_embedding = model.get_text_embedding("test")
-        return len(test_embedding)
-    else:
-        # Для HuggingFace можем получить из _model
-        try:
-            return model._model.get_sentence_embedding_dimension()
-        except AttributeError:
-            # Fallback: тестовый запрос
-            test_embedding = model.get_text_embedding("test")
-            return len(test_embedding)
+    return model.get_embedding_dimension()
+
 
 def generate_query_embedding(query: str) -> List[float]:
-    """
-    Генерирует embedding для одного запроса.
-    
-    Поддерживает как HuggingFace, так и Ollama.
-    
-    Args:
-        query: Текст запроса
-        
-    Returns:
-        Список float значений (embedding вектор)
-    """
+    """Helper to generate single embedding."""
     model = get_embed_model()
-    
-    # LlamaIndex embeddings имеют унифицированный метод get_query_embedding()
-    embedding = model.get_query_embedding(query)
-    
-    return embedding
+    return model.get_query_embedding(query)
+
 
 def generate_query_embeddings_batch(queries: List[str]) -> List[List[float]]:
-    """
-    Генерирует embeddings для списка запросов.
-    
-    ОПТИМИЗАЦИЯ для HuggingFace: 
-    - Batch encoding в 3-5 раз быстрее через внутренний SentenceTransformer
-    
-    ОПТИМИЗАЦИЯ для OpenAI-compatible API:
-    - Batch encoding через API (если поддерживается)
-    
-    ОПТИМИЗАЦИЯ для Ollama:
-    - Итерация по запросам (Ollama API не поддерживает batch)
-    
-    Args:
-        queries: Список текстов запросов
-        
-    Returns:
-        Список embedding векторов
-    """
-    global _embed_model_type
-    
+    """Helper to generate batch embeddings."""
     model = get_embed_model()
-    
-    if _embed_model_type == 'openai':
-        # OpenAI-compatible API: пробуем batch, fallback на последовательные запросы
-        try:
-            # Используем приватные атрибуты для CustomOpenAIEmbedding
-            if hasattr(model, '_client'):
-                # CustomOpenAIEmbedding использует приватные атрибуты
-                response = model._client.embeddings.create(
-                    model=model._model_name,
-                    input=queries
-                )
-                return [item.embedding for item in response.data]
-            else:
-                # Стандартный OpenAIEmbedding из LlamaIndex
-                response = model.client.embeddings.create(
-                    model=model.model_name,
-                    input=queries
-                )
-                return [item.embedding for item in response.data]
-        except Exception as e:
-            logger.debug(f"Batch не поддерживается, используем последовательные запросы: {e}")
-            return [model.get_query_embedding(q) for q in queries]
-    elif _embed_model_type == 'huggingface':
-        # HuggingFace: используем batch encoding через внутренний SentenceTransformer
-        try:
-            sentence_model = model._model
-            embeddings = sentence_model.encode(queries, normalize_embeddings=False)
-            return [emb.tolist() for emb in embeddings]
-        except AttributeError:
-            # Fallback если _model недоступен
-            logger.warning("Не удалось использовать batch encoding, fallback на последовательную генерацию")
-            return [model.get_query_embedding(q) for q in queries]
-    else:
-        # Ollama: по одному запросу (нет batch API)
-        return [model.get_query_embedding(q) for q in queries]
-
-def validate_collection_dimension(collection, expected_dim: int = None) -> tuple[bool, int, int]:
-    """
-    Проверяет совпадение размерности embeddings в ChromaDB с текущей моделью.
-    
-    Args:
-        collection: ChromaDB collection
-        expected_dim: Ожидаемая размерность (если None - берется из модели)
-        
-    Returns:
-        tuple: (is_valid, collection_dim, model_dim)
-    """
-    try:
-        # Получаем размерность из collection
-        data = collection.get(limit=1, include=['embeddings'])
-        embeddings = data.get('embeddings', [])
-        
-        if len(embeddings) == 0 or embeddings[0] is None:
-            logger.warning("⚠️ ChromaDB пустая, размерность не определена")
-            return (True, 0, 0)  # Пустая база - OK
-        
-        collection_dim = len(embeddings[0])
-        
-        # Получаем размерность модели
-        if expected_dim is None:
-            model_dim = get_embedding_dimension()
-        else:
-            model_dim = expected_dim
-        
-        is_valid = (collection_dim == model_dim)
-        
-        if not is_valid:
-            logger.error(
-                f"❌ НЕСОВПАДЕНИЕ РАЗМЕРНОСТИ!\n"
-                f"   ChromaDB: {collection_dim} dimensions\n"
-                f"   Модель {EMBED_MODEL}: {model_dim} dimensions\n"
-                f"   → Необходима пересинхронизация базы!"
-            )
-        else:
-            logger.info(f"✅ Размерность embeddings корректна: {model_dim}D")
-        
-        return (is_valid, collection_dim, model_dim)
-        
-    except Exception as e:
-        logger.error(f"Ошибка проверки размерности: {e}")
-        return (False, 0, 0)
-
+    return model.get_text_embeddings(queries)

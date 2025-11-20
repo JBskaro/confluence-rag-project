@@ -19,8 +19,7 @@ CONFLUENCE_TOKEN=your_api_token_here
 # ХРАНИЛИЩЕ ДАННЫХ
 # ============================================
 
-# Путь к базе данных ChromaDB
-CHROMA_PATH=./chroma_data
+
 
 # Файл состояния синхронизации
 STATE_FILE=./sync_state.json

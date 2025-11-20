@@ -1,0 +1,14 @@
+apiVersion: 1
+
+providers:
+  - name: 'Confluence RAG Dashboards'
+    orgId: 1
+    folder: 'Confluence RAG'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
+

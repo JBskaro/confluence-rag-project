@@ -19,81 +19,44 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
 
 # Virtual environments
 venv/
-env/
+.venv/
 ENV/
-.venv
+env/
 
 # IDE
 .vscode/
 .idea/
-.cursor/
 *.swp
 *.swo
 *~
-.DS_Store
 
-# Environment variables
-.env
-.env.local
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Data
+chroma_data/
+data/
+*.db
+*.sqlite
 
 # Logs
 *.log
-app.log
 
-# Database
-chroma_data/
-chroma_db/
-chroma_db_test/
-*.db
-*.sqlite
-*.sqlite3
+# Environment
+.env
+.env.local
 
-# Sync state
-sync_state.json
-data/sync_state.json
-
-# Data directory (cache, synonyms, logs)
-data/
-!data/.gitkeep
-
-# Model cache
-model_cache/
-
-# Backups
-backups/
-*.tar.gz
-*.bak
-*.backup
-
-# Docker
-# .dockerignore should be tracked in git
-
-# Test files
-test_*.py
-!tests/
+# OS
+.DS_Store
+Thumbs.db
 
 # Temporary files
 *.tmp
-
-# OS
-Thumbs.db
-.DS_Store
-
-# MCP specific
-instruction/test_*.py
-
-# Archive directory (temporary files, old reports, analysis)
+*.bak
 archive/
-
-# Test data (temporary test files)
-test_data/
-
-# Scripts directory (utility scripts, not part of core project)
-scripts/
-
-# Tests directory (test files, not needed in production)
-tests/

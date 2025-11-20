@@ -1,0 +1,34 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'confluence-rag'
+    environment: 'production'
+
+scrape_configs:
+  # Confluence RAG app metrics (Prometheus client)
+  - job_name: 'confluence-rag'
+    static_configs:
+      - targets: ['confluence-rag:8001']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  # Tempo self-monitoring
+  - job_name: 'tempo'
+    static_configs:
+      - targets: ['tempo:3200']
+    scrape_interval: 30s
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+    scrape_interval: 30s
+
+  # Qdrant metrics (if exposed)
+  - job_name: 'qdrant'
+    static_configs:
+      - targets: ['qdrant:6333']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+

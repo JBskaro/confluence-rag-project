@@ -71,10 +71,21 @@ try:
         buckets=[0.001, 0.01, 0.05, 0.1, 0.5]
     )
     
+    # Connection metrics
+    QDRANT_CONNECTION_ERRORS = Counter(
+        'confluence_qdrant_connection_errors_total',
+        'Total Qdrant connection failures'
+    )
+
     # Cache metrics
     CACHE_HITS = Counter(
         'confluence_cache_hits_total',
         'Total cache hits'
+    )
+    
+    EMBEDDING_CACHE_HITS = Counter(
+        'confluence_embedding_cache_hits_total',
+        'Total embedding cache hits'
     )
     
     CACHE_MISSES = Counter(
@@ -93,6 +104,9 @@ try:
         'Total search requests',
         ['query_type', 'status']
     )
+    
+    # Alias for search pipeline compatibility
+    SEARCH_REQUESTS = REQUESTS_TOTAL
     
     # Reranking metrics
     RERANK_DOCS = Histogram(

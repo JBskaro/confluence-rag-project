@@ -9,8 +9,6 @@ import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, Range, PayloadSchemaType
-from llama_index.vector_stores.qdrant import QdrantVectorStore
-from llama_index.core import StorageContext, VectorStoreIndex, Document
 
 # Инициализация logger (должен быть до использования)
 logger = logging.getLogger(__name__)
@@ -64,8 +62,6 @@ QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "confluence")
 
 qdrant_client = None
-vector_store = None
-index = None
 
 def init_qdrant_client() -> QdrantClient:
     """Инициализировать Qdrant клиент."""
@@ -288,23 +284,10 @@ def insert_chunks_batch_to_qdrant(
                 success_count += len(points)
             except Exception as e:
                 logger.error(f"Error inserting batch {i//batch_size + 1}: {e}")
-                error_count += len(points)
+                # Не увеличиваем error_count - точки не были обработаны
+                # Они останутся в chunks_data и могут быть обработаны позже при retry
     
     return success_count, error_count
-
-def get_qdrant_vector_store():
-    """Получить Qdrant vector store."""
-    global vector_store
-    if vector_store is None:
-        client = init_qdrant_client()
-        vector_store = QdrantVectorStore(
-            client=client,
-            collection_name=QDRANT_COLLECTION,
-            batch_size=100
-            # NOTE: Текст сохраняется через metadata['text'] в sync_confluence.py (lines 1537, 1799)
-        )
-    return vector_store
-
 
 def search_in_qdrant(
     query_embedding: List[float],
@@ -741,6 +724,51 @@ def delete_points_by_page_ids(page_ids: List[str], chunk_size: int = 500) -> int
     
     return total_deleted
 
+def clear_qdrant_collection() -> int:
+    """
+    Полностью очистить коллекцию Qdrant (удалить все точки).
+    
+    Returns:
+        Количество удаленных точек
+    """
+    client = init_qdrant_client()
+    try:
+        # Получаем все точки батчами
+        total_deleted = 0
+        offset = None
+        
+        while True:
+            scroll_result = client.scroll(
+                collection_name=QDRANT_COLLECTION,
+                limit=10000,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False
+            )
+            
+            points, next_offset = scroll_result
+            
+            if not points:
+                break
+            
+            point_ids = [point.id for point in points]
+            client.delete(
+                collection_name=QDRANT_COLLECTION,
+                points_selector=point_ids
+            )
+            total_deleted += len(point_ids)
+            logger.info(f"Удалено {len(point_ids)} точек (всего: {total_deleted})")
+            
+            if next_offset is None:
+                break
+            offset = next_offset
+        
+        logger.info(f"✅ Qdrant коллекция очищена: удалено {total_deleted} точек")
+        return total_deleted
+    except Exception as e:
+        logger.error(f"Ошибка очистки Qdrant коллекции: {e}")
+        return 0
+
 def get_all_points(limit: int = 10000, include_payload: bool = True) -> Dict[str, Any]:
     """
     Получить все точки из Qdrant (аналог collection.get() для ChromaDB).
@@ -754,6 +782,7 @@ def get_all_points(limit: int = 10000, include_payload: bool = True) -> Dict[str
     """
     client = init_qdrant_client()
     try:
+        # Используем scroll для получения всех точек
         scroll_result = client.scroll(
             collection_name=QDRANT_COLLECTION,
             limit=limit,
@@ -761,116 +790,26 @@ def get_all_points(limit: int = 10000, include_payload: bool = True) -> Dict[str
             with_vectors=False
         )
         
-        points = scroll_result[0]
+        points, _ = scroll_result
+        
         ids = []
         documents = []
         metadatas = []
         
         for point in points:
             ids.append(str(point.id))
-            payload = point.payload or {}
             
-            if include_payload:
-                # КРИТИЧНО: Используем функцию извлечения текста (поддерживает LlamaIndex формат)
-                text = extract_text_from_payload(payload)
+            if include_payload and point.payload:
+                # Извлекаем текст
+                text = extract_text_from_payload(point.payload)
                 documents.append(text)
-                # Метаданные - все кроме 'text' и '_node_content'
-                metadata = {k: v for k, v in payload.items() if k not in ('text', '_node_content')}
-                metadatas.append(metadata)
-        
-        return {
-            'ids': ids,
-            'documents': documents if include_payload else [],
-            'metadatas': metadatas if include_payload else []
-        }
-    except Exception as e:
-        logger.error(f"Ошибка получения всех точек из Qdrant: {e}")
-        return {'ids': [], 'documents': [], 'metadatas': []}
-
-def get_points_by_filter(filter_dict: Dict[str, Any], limit: int = 1000) -> Dict[str, Any]:
-    """
-    Получить точки по фильтру (аналог collection.get(where=...) для ChromaDB).
-    
-    Args:
-        filter_dict: Словарь с условиями фильтрации (например, {'page_id': '123'})
-        limit: Максимальное количество точек
-    
-    Returns:
-        Словарь в формате {'ids': [...], 'documents': [...], 'metadatas': [...]}
-    """
-    client = init_qdrant_client()
-    try:
-        # Преобразуем filter_dict в Qdrant Filter
-        conditions = []
-        for key, value in filter_dict.items():
-            if isinstance(value, dict):
-                # Поддержка операторов типа {'$gte': 0}
-                if '$gte' in value:
-                    conditions.append(
-                        FieldCondition(
-                            key=key,
-                            range=Range(gte=value['$gte'])
-                        )
-                    )
-                elif '$lte' in value:
-                    conditions.append(
-                        FieldCondition(
-                            key=key,
-                            range=Range(lte=value['$lte'])
-                        )
-                    )
-                elif '$and' in value:
-                    # Рекурсивная обработка $and
-                    and_conditions = []
-                    for and_item in value['$and']:
-                        for k, v in and_item.items():
-                            if isinstance(v, dict) and '$gte' in v:
-                                and_conditions.append(
-                                    FieldCondition(
-                                        key=k,
-                                        range=Range(gte=v['$gte'])
-                                    )
-                                )
-                            else:
-                                and_conditions.append(
-                                    FieldCondition(
-                                        key=k,
-                                        match=MatchValue(value=v)
-                                    )
-                                )
-                    conditions.extend(and_conditions)
+                
+                # Метаданные (все кроме текста)
+                meta = {k: v for k, v in point.payload.items() if k not in ['text', '_node_content']}
+                metadatas.append(meta)
             else:
-                conditions.append(
-                    FieldCondition(
-                        key=key,
-                        match=MatchValue(value=value)
-                    )
-                )
-        
-        qdrant_filter = Filter(must=conditions) if conditions else None
-        
-        scroll_result = client.scroll(
-            collection_name=QDRANT_COLLECTION,
-            scroll_filter=qdrant_filter,
-            limit=limit,
-            with_payload=True,
-            with_vectors=False
-        )
-        
-        points = scroll_result[0]
-        ids = []
-        documents = []
-        metadatas = []
-        
-        for point in points:
-            ids.append(str(point.id))
-            payload = point.payload or {}
-            # КРИТИЧНО: Используем функцию извлечения текста (поддерживает LlamaIndex формат)
-            text = extract_text_from_payload(payload)
-            documents.append(text)
-            # Метаданные - все кроме 'text' и '_node_content'
-            metadata = {k: v for k, v in payload.items() if k not in ('text', '_node_content')}
-            metadatas.append(metadata)
+                documents.append("")
+                metadatas.append({})
         
         return {
             'ids': ids,
@@ -878,6 +817,5 @@ def get_points_by_filter(filter_dict: Dict[str, Any], limit: int = 1000) -> Dict
             'metadatas': metadatas
         }
     except Exception as e:
-        logger.error(f"Ошибка получения точек по фильтру из Qdrant: {e}")
+        logger.error(f"Ошибка получения всех точек: {e}")
         return {'ids': [], 'documents': [], 'metadatas': []}
-

@@ -1,0 +1,39 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: "15s"
+      queryTimeout: "60s"
+      httpMethod: POST
+
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      tracesToMetrics:
+        datasourceUid: 'prometheus'
+        tags: [{ key: 'service.name', value: 'service_name' }]
+        queries:
+          - name: 'Request rate'
+            query: 'sum(rate(tempo_spanmetrics_calls_total{$$__tags}[5m]))'
+          - name: 'Request duration'
+            query: 'histogram_quantile(0.95, sum(rate(tempo_spanmetrics_duration_seconds_bucket{$$__tags}[5m])) by (le))'
+      tracesToLogs:
+        datasourceUid: 'prometheus'
+      serviceMap:
+        datasourceUid: 'prometheus'
+      nodeGraph:
+        enabled: true
+      search:
+        hide: false
+      lokiSearch:
+        datasourceUid: 'prometheus'
+

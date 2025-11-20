@@ -21,8 +21,16 @@ COPY rag_server/query_rewriter.py query_rewriter.py
 COPY rag_server/hybrid_search.py hybrid_search.py
 COPY rag_server/context_expansion.py context_expansion.py
 COPY rag_server/qdrant_storage.py qdrant_storage.py
+COPY rag_server/postgres_storage.py postgres_storage.py
+COPY rag_server/hallucination_detector.py hallucination_detector.py
+COPY rag_server/mmr_reranker.py mmr_reranker.py
+COPY rag_server/observability.py observability.py
+COPY rag_server/response_formatter.py response_formatter.py
+COPY rag_server/self_query_parser.py self_query_parser.py
 COPY rag_server/sync_confluence.py sync.py
 COPY rag_server/mcp_rag_secure.py server.py
+# Копирование utils модулей
+COPY rag_server/utils/ utils/
 
 # Переменные окружения
 ENV PYTHONUNBUFFERED=1
