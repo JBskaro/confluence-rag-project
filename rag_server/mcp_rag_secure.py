@@ -117,7 +117,7 @@ def expand_query(query: str, space: str = "") -> list[str]:  # noqa: C901
     Умное расширение запроса с использованием множественных источников синонимов.
 
     Источники синонимов (в порядке приоритета):
-    1. НОВОЕ: Semantic Query Log (успешные запросы пользователей) ← ВЫСШИЙ ПРИОРИТЕТ!
+    1. НОВОЕ: Semantic Query Log (успешные запросы пользователей) <- ВЫСШИЙ ПРИОРИТЕТ!
     2. Базовый словарь (50 общих IT-терминов)
     3. Доменные термины (автоматически из Confluence)
     4. Выученные синонимы (Query Mining)
@@ -138,11 +138,11 @@ def expand_query(query: str, space: str = "") -> list[str]:  # noqa: C901
     # ОПТИМИЗАЦИЯ: Определяем максимальное количество вариантов по длине запроса
     query_length = len(query.split())
     if query_length <= 2:
-        max_variants = 5  # Короткий запрос → больше вариантов для покрытия
+        max_variants = 5  # Короткий запрос -> больше вариантов для покрытия
     elif query_length <= 4:
-        max_variants = 3  # Средний запрос → умеренное расширение
+        max_variants = 3  # Средний запрос -> умеренное расширение
     else:
-        max_variants = 2  # Длинный запрос → минимальное расширение (уже специфичен)
+        max_variants = 2  # Длинный запрос -> минимальное расширение (уже специфичен)
 
     # === ИСТОЧНИК 1 (ВЫСШИЙ ПРИОРИТЕТ): Semantic Query Log (успешные запросы пользователей) ===
     semantic_log = None  # Инициализируем для использования в Query Rewriting
@@ -205,7 +205,7 @@ def expand_query(query: str, space: str = "") -> list[str]:  # noqa: C901
     except Exception as e:
         logger.warning(f"Ошибка при расширении запроса через SynonymsManager: {e}")
 
-    # === ИСТОЧНИК 5: Query Rewriting (Ollama → OpenRouter) ===
+    # === ИСТОЧНИК 5: Query Rewriting (Ollama -> OpenRouter) ===
     try:
         rewrite_variants = cached_rewrite_query(query, semantic_log=semantic_log)
         for variant in rewrite_variants[1:]:  # Пропускаем первый (оригинал)
@@ -546,6 +546,9 @@ def expand_context_window(result: dict, window_size: int = 1) -> dict:
 
     except Exception as e:
         logger.warning(f"Context expansion failed: {e}")
+
+def calculate_hierarchy_boost(metadata: dict) -> float:
+    """
     Hierarchy Boost - техника из Elasticsearch и Pinecone для учета
     важности документов на основе их положения в структуре.
 
@@ -613,7 +616,7 @@ def calculate_breadcrumb_match_score(query: str, breadcrumb: str) -> float:
 
     Args:
         query: Поисковый запрос
-        breadcrumb: Путь страницы (Space → Parent → Page → Section)
+        breadcrumb: Путь страницы (Space > Parent > Page > Section)
 
     Returns:
         Score от 0.0 до 1.0
@@ -696,13 +699,13 @@ def parse_query_structure(query: str) -> Dict[str, Any]:  # noqa: C901
     """
     Парсит структурные компоненты запроса.
 
-    Определяет является ли запрос структурным (с разделителями >, →)
+    Определяет является ли запрос структурным (с разделителями >, >)
     и извлекает части запроса.
 
     Примеры:
-    - "Склад > Учет номенклатуры" → structural
-    - "технологический стек RAUII" → обычный
-    - "Обследование > Склад > Учет номенклатуры" → structural
+    - "Склад > Учет номенклатуры" > structural
+    - "технологический стек RAUII" > обычный
+    - "Обследование > Склад > Учет номенклатуры" > structural
 
     Args:
         query: Исходный запрос
@@ -1495,6 +1498,12 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
 
 @mcp.tool()
 def confluence_list_spaces() -> str:
+    """
+    Возвращает список всех доступных пространств Confluence.
+
+    Returns:
+        Форматированный список пространств с количеством документов
+    """
 
     try:
         if qdrant_client is None:
@@ -1533,6 +1542,12 @@ def confluence_list_spaces() -> str:
 
 @mcp.tool()
 def confluence_health() -> str:
+    """
+    Проверяет состояние RAG системы и возвращает статистику.
+
+    Returns:
+        Информация о состоянии системы и статистика
+    """
 
     try:
         # Проверка что RAG инициализирована при старте сервера
