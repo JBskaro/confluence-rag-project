@@ -42,6 +42,7 @@ htmlcov/
 # Data
 chroma_data/
 data/
+qdrant_storage/
 *.db
 *.sqlite
 
@@ -60,3 +61,6 @@ Thumbs.db
 *.tmp
 *.bak
 archive/
+check_*.py
+fix_*.py
+remove_*.py
