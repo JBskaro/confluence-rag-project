@@ -52,16 +52,16 @@ class SearchResult:
 
 class SearchPipeline:
     """Orchestrator для поискового пайплайна"""
-    
+
     def __init__(self, qdrant_client: QdrantClient, collection_name: str, reranker=None):
         self.qdrant_client = qdrant_client
         self.collection_name = collection_name
         self.reranker = reranker
-    
+
     def execute(self, params: SearchParams) -> List[Dict[str, Any]]:
         """
         Основной pipeline выполнения поиска.
-        
+
         Steps:
         1. Validation
         2. Embedding Generation (Batch)
@@ -71,49 +71,49 @@ class SearchPipeline:
         6. Formatting
         """
         start_time = time.time()
-        
+
         with tracer.start_as_current_span("search_pipeline.execute") as span:
             span.set_attribute("query", params.query)
             span.set_attribute("space", params.space or "all")
             span.set_attribute("limit", params.limit)
             span.set_attribute("expanded_queries_count", len(params.expanded_queries))
-            
+
             if SEARCH_REQUESTS:
                 SEARCH_REQUESTS.inc()
-            
+
             try:
                 # 1. Prepare queries (original + expanded)
                 queries = [params.query]
                 if params.expanded_queries:
                     queries.extend(params.expanded_queries)
-                
+
                 # Remove duplicates and empty strings
                 queries = list(dict.fromkeys([q for q in queries if q and q.strip()]))
-                
+
                 # 2. Generate Embeddings (Batch)
                 embeddings = self._get_embeddings_batch(queries)
-                
+
                 # 3. Parallel Vector Search
                 raw_results = self._parallel_search(queries, embeddings, params)
-                
+
                 # 4. Deduplication
                 unique_results = self._deduplicate(raw_results)
-                
+
                 # 5. Reranking
                 if params.use_reranking and self.reranker and unique_results:
                     unique_results = self._rerank(params.query, unique_results)
                 else:
                     # Sort by vector score if no reranking
                     unique_results.sort(key=lambda x: x.get("score", 0), reverse=True)
-                
+
                 # 6. Final Filtering
                 final_results = unique_results[:params.limit]
-                
+
                 if SEARCH_LATENCY:
                     SEARCH_LATENCY.observe(time.time() - start_time)
-                
+
                 return final_results
-                
+
             except Exception as e:
                 logger.error(f"Search pipeline failed: {e}", exc_info=True)
                 span.record_exception(e)
@@ -135,24 +135,24 @@ class SearchPipeline:
         start_time = time.time()
         all_results = []
         max_workers = min(len(queries), int(os.getenv('PARALLEL_SEARCH_MAX_WORKERS', '4')))
-        
+
         with tracer.start_as_current_span("parallel_search") as span:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
                     executor.submit(self._single_search, queries[i], embeddings[i], params): queries[i]
                     for i in range(len(queries))
                 }
-                
+
                 for future in as_completed(futures):
                     try:
                         results = future.result()
                         all_results.extend(results)
                     except Exception as e:
                         logger.error(f"Search failed for query variant: {e}")
-            
+
             if VECTOR_SEARCH_LATENCY:
                 VECTOR_SEARCH_LATENCY.observe(time.time() - start_time)
-                
+
             return all_results
 
     def _single_search(self, query_text: str, embedding: List[float], params: SearchParams) -> List[Dict[str, Any]]:
@@ -168,10 +168,10 @@ class SearchPipeline:
                     )
                 ]
             )
-        
+
         # Search limit (fetch more for reranking)
         search_limit = params.limit * 3 if params.use_reranking else params.limit
-        
+
         try:
             points = self.qdrant_client.search(
                 collection_name=self.collection_name,
@@ -180,7 +180,7 @@ class SearchPipeline:
                 limit=search_limit,
                 score_threshold=params.threshold if not params.use_reranking else 0.0
             )
-            
+
             results = []
             for point in points:
                 payload = point.payload or {}
@@ -192,7 +192,7 @@ class SearchPipeline:
                     "query_variant": query_text
                 })
             return results
-            
+
         except Exception as e:
             if QDRANT_CONNECTION_ERRORS:
                 QDRANT_CONNECTION_ERRORS.inc()
@@ -213,24 +213,24 @@ class SearchPipeline:
         """Rerank results using CrossEncoder"""
         if not results:
             return []
-            
+
         start_time = time.time()
         with tracer.start_as_current_span("rerank_results") as span:
             try:
                 pairs = [(query, r["text"]) for r in results]
                 scores = self.reranker.predict(pairs)
-                
+
                 for i, score in enumerate(scores):
                     results[i]["rerank_score"] = float(score)
                     results[i]["boosted_score"] = float(score) # Alias
-                
+
                 results.sort(key=lambda x: x["rerank_score"], reverse=True)
-                
+
                 if RERANK_LATENCY:
                     RERANK_LATENCY.observe(time.time() - start_time)
-                
+
                 return results
-                
+
             except Exception as e:
                 logger.warning(f"Reranking failed: {e}")
                 return results

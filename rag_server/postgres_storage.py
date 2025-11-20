@@ -34,11 +34,11 @@ _postgres_pool = None
 def get_postgres_pool():
     """
     Получить connection pool для PostgreSQL.
-    
+
     ✅ Создается один раз и переиспользуется.
     """
     global _postgres_pool
-    
+
     if _postgres_pool is None:
         try:
             _postgres_pool = pool.ThreadedConnectionPool(
@@ -55,7 +55,7 @@ def get_postgres_pool():
         except Exception as e:
             logger.error(f"❌ Failed to create PostgreSQL connection pool: {e}")
             raise
-    
+
     return _postgres_pool
 
 
@@ -63,9 +63,9 @@ def get_postgres_pool():
 def get_postgres_connection():
     """
     Context manager для получения соединения из пула.
-    
+
     ✅ Автоматически возвращает соединение в пул после использования.
-    
+
     Usage:
         with get_postgres_connection() as conn:
             cursor = conn.cursor()
@@ -73,7 +73,7 @@ def get_postgres_connection():
     """
     pool_obj = get_postgres_pool()
     conn = pool_obj.getconn()
-    
+
     try:
         yield conn
     finally:
@@ -85,7 +85,7 @@ def close_postgres_pool():
     Закрыть connection pool (для graceful shutdown).
     """
     global _postgres_pool
-    
+
     if _postgres_pool is not None:
         _postgres_pool.closeall()
         _postgres_pool = None
@@ -126,7 +126,7 @@ def init_postgres_schema():
                         indexed_at TIMESTAMP,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
-                    
+
                     CREATE INDEX IF NOT EXISTS idx_space_key ON confluence_pages(space_key);
                     CREATE INDEX IF NOT EXISTS idx_indexed_at ON confluence_pages(indexed_at);
                     CREATE INDEX IF NOT EXISTS idx_updated_at ON confluence_pages(updated_at);
@@ -153,10 +153,10 @@ def save_page_to_postgres(
         with get_postgres_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO confluence_pages 
+                    INSERT INTO confluence_pages
                     (page_id, space_key, title, content_html, content_markdown, version, metadata, updated_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (page_id) 
+                    ON CONFLICT (page_id)
                     DO UPDATE SET
                         space_key = EXCLUDED.space_key,
                         title = EXCLUDED.title,
@@ -187,20 +187,20 @@ def get_pages_from_postgres(
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 query = "SELECT * FROM confluence_pages WHERE 1=1"
                 params = []
-                
+
                 if space_key:
                     query += " AND space_key = %s"
                     params.append(space_key)
-                
+
                 if not_indexed:
                     query += " AND indexed_at IS NULL"
-                
+
                 query += " ORDER BY updated_at DESC"
-                
+
                 if limit:
                     query += " LIMIT %s"
                     params.append(limit)
-                
+
                 cur.execute(query, params)
                 rows = cur.fetchall()
                 result = []
@@ -241,13 +241,13 @@ def cleanup_deleted_pages_postgres(current_page_ids: set) -> int:
                 # Получаем все page_id из PostgreSQL
                 cur.execute("SELECT page_id FROM confluence_pages")
                 all_page_ids = {row[0] for row in cur.fetchall()}
-                
+
                 # Находим удаленные
                 deleted_page_ids = all_page_ids - current_page_ids
-                
+
                 if not deleted_page_ids:
                     return 0
-                
+
                 # Удаляем
                 cur.execute(
                     "DELETE FROM confluence_pages WHERE page_id = ANY(%s)",
@@ -263,7 +263,7 @@ def cleanup_deleted_pages_postgres(current_page_ids: set) -> int:
 def clear_all_pages_postgres() -> int:
     """
     Полностью очистить таблицу confluence_pages (удалить все страницы).
-    
+
     Returns:
         Количество удаленных страниц
     """
@@ -273,7 +273,7 @@ def clear_all_pages_postgres() -> int:
                 # Получаем количество перед удалением
                 cur.execute("SELECT COUNT(*) FROM confluence_pages")
                 count = cur.fetchone()[0]
-                
+
                 # Удаляем все
                 cur.execute("TRUNCATE TABLE confluence_pages RESTART IDENTITY CASCADE")
                 conn.commit()
@@ -289,7 +289,7 @@ def get_postgres_stats() -> Dict[str, Any]:
         with get_postgres_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT 
+                    SELECT
                         COUNT(*) as total_pages,
                         COUNT(CASE WHEN indexed_at IS NULL THEN 1 END) as not_indexed,
                         COUNT(DISTINCT space_key) as spaces_count

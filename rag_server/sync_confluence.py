@@ -111,7 +111,7 @@ MAX_METADATA_LIST_SIZE = 10  # Максимальный размер списк�
 def sanitize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
     Обрезает большие поля метаданных для предотвращения избыточного хранения.
-    
+
     КРИТИЧНО: Поле 'text' НЕ обрезается, т.к. это основной контент чанка.
 
     Args:
@@ -447,6 +447,191 @@ def build_page_path(space_key: str, parent_titles: List[str]) -> str:
     return '/'.join(path_parts) if path_parts else space_key
 
 
+def _extract_basic_fields(page_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Извлечение базовых полей: status, type."""
+    metadata = {'status': 'current', 'type': 'page'}
+
+    # Status
+    try:
+        status = page_data.get('status', 'current')
+        if isinstance(status, str):
+            metadata['status'] = status.lower()
+        else:
+            expandable = page_data.get('_expandable', {})
+            if 'status' in expandable:
+                metadata['status'] = 'current'
+    except Exception as e:
+        logger.debug(f"Error extracting status: {e}")
+
+    # Type
+    try:
+        page_type = page_data.get('type', 'page')
+        if isinstance(page_type, str):
+            metadata['type'] = page_type.lower()
+    except Exception as e:
+        logger.debug(f"Error extracting type: {e}")
+
+    return metadata
+
+def _extract_labels(page_data: Dict[str, Any]) -> List[str]:
+    """Извлечение меток страницы."""
+    try:
+        labels_data = page_data.get('metadata', {}).get('labels', {})
+        if isinstance(labels_data, dict):
+            labels = labels_data.get('results', [])
+        elif isinstance(labels_data, list):
+            labels = labels_data
+        else:
+            labels = []
+
+        return [
+            label.get('name', '') for label in labels
+            if isinstance(label, dict) and label.get('name')
+        ]
+    except Exception as e:
+        logger.debug(f"Error extracting labels: {e}")
+        return []
+
+def _extract_hierarchy(page_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Извлечение информации об иерархии (родители, глубина)."""
+    result = {
+        'parent_id': '',
+        'parent_title': '',
+        'hierarchy_depth': 0,
+        'parent_titles': []
+    }
+    try:
+        ancestors = page_data.get('ancestors', [])
+        if ancestors and isinstance(ancestors, list):
+            if len(ancestors) > 0:
+                parent = ancestors[-1]
+                if isinstance(parent, dict):
+                    result['parent_id'] = str(parent.get('id', ''))
+                    result['parent_title'] = str(parent.get('title', ''))
+
+            result['hierarchy_depth'] = len(ancestors)
+
+            for ancestor in ancestors:
+                if isinstance(ancestor, dict):
+                    title = ancestor.get('title', '')
+                    if title:
+                        result['parent_titles'].append(title)
+    except Exception as e:
+        logger.debug(f"Error extracting ancestors: {e}")
+
+    return result
+
+def _extract_version_info(page_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Извлечение информации о версии, датах и авторах."""
+    result = {
+        'version': 1,
+        'created': '',
+        'modified': '',
+        'created_by': '',
+        'modified_by': '',
+        'modified_date': ''
+    }
+    try:
+        version = page_data.get('version', {})
+        if isinstance(version, dict):
+            result['version'] = int(version.get('number', 1))
+
+            modified_when = version.get('when', '')
+            if modified_when:
+                result['modified_date'] = str(modified_when)
+                result['modified'] = modified_when
+
+            by_info = version.get('by', {})
+            if isinstance(by_info, dict):
+                result['modified_by'] = str(by_info.get('displayName', ''))
+
+        history = page_data.get('history', {})
+        if isinstance(history, dict):
+            result['created'] = history.get('createdDate', '') or result['modified']
+
+            created_by = history.get('createdBy', {})
+            if isinstance(created_by, dict):
+                result['created_by'] = str(created_by.get('displayName', ''))
+            elif not result['created_by']: # Fallback
+                 result['created_by'] = result['modified_by']
+
+    except Exception as e:
+        logger.debug(f"Error extracting version info: {e}")
+
+    return result
+
+def _extract_headings_from_html(content_html: str, page_id: str) -> Dict[str, Any]:
+    """Извлечение заголовков из HTML."""
+    result = {
+        'headings': '',
+        'headings_list': [],
+        'heading_hierarchy': [],
+        'heading_count': 0
+    }
+
+    if not content_html:
+        return result
+
+    try:
+        headings_start = time.time()
+        soup = BeautifulSoup(content_html, 'html.parser')
+
+        headings = []
+        heading_hierarchy = []
+        current_path = []
+
+        MAX_HEADINGS = MAX_HEADINGS_EXTRACT
+
+        for i, heading_tag in enumerate(soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])):
+            if i >= MAX_HEADINGS:
+                logger.debug(f"Truncated headings at {MAX_HEADINGS} for page {page_id}")
+                break
+
+            heading_text = heading_tag.get_text(strip=True)
+            heading_text = html.unescape(heading_text)
+
+            if not heading_text:
+                continue
+
+            heading_level = int(heading_tag.name[1])
+
+            headings.append({'text': heading_text, 'level': heading_level})
+
+            # Hierarchy logic
+            while len(current_path) > 0 and len(current_path) >= heading_level:
+                current_path.pop()
+            current_path.append(heading_text)
+
+            heading_hierarchy.append({
+                'text': heading_text,
+                'level': heading_level,
+                'path': ' > '.join(current_path)
+            })
+
+        all_headings = [h['text'] for h in headings]
+
+        # Form string
+        headings_string = ' | '.join(all_headings)
+        if len(headings_string) > MAX_HEADINGS_STRING_LENGTH:
+            headings_string = headings_string[:MAX_HEADINGS_STRING_LENGTH] + "..."
+
+        result = {
+            'headings': headings_string,
+            'headings_list': all_headings,
+            'heading_hierarchy': heading_hierarchy,
+            'heading_count': len(all_headings)
+        }
+
+        # Performance check
+        headings_time = (time.time() - headings_start) * 1000
+        if headings_time > 100:
+             logger.warning(f"⚠️ Slow headings extraction: {headings_time:.0f}ms for {page_id}")
+
+    except Exception as e:
+        logger.debug(f"Error extracting headings: {e}")
+
+    return result
+
 def extract_page_metadata(page_data: Dict[str, Any], space_key: str = '') -> Dict[str, Any]:
     """
     Извлечение ПОЛНЫХ метаданных из Confluence страницы с защитой от ошибок.
@@ -461,278 +646,70 @@ def extract_page_metadata(page_data: Dict[str, Any], space_key: str = '') -> Dic
     Returns:
         Словарь с полными метаданными (всегда возвращает все ключи)
     """
-    metadata = {
-        'labels': [],
-        'parent_id': '',
-        'parent_title': '',
-        'page_path': '',  # НОВОЕ: полный путь страницы (URL-friendly)
-        'breadcrumb': '',  # НОВОЕ: полный путь с разделителями >
-        'version': 1,
-        'created_by': '',
-        'modified_date': '',
-        'has_children': False,
-        'children_count': 0,
-        'attachments': [],
-        # НОВЫЕ ПОЛЯ для metadata indexing:
-        'status': 'current',  # current, archived, draft
-        'type': 'page',      # page, blogpost, attachment
-        'hierarchy_depth': 0,
-        'created': '',       # ISO format для фильтрации
-        'modified': '',      # ISO format для фильтрации
-        'modified_by': '',   # Кто последний раз редактировал
-        # НОВЫЕ ПОЛЯ для заголовков:
-        'headings': '',
-        'headings_list': [],
-        'heading_hierarchy': [],
-        'heading_count': 0,
-        'parent_titles': [],
-    }
-
     if not page_data or not isinstance(page_data, dict):
         logger.debug("Invalid page_data structure")
-        return metadata
+        return {
+            'labels': [], 'parent_id': '', 'parent_title': '', 'page_path': '',
+            'breadcrumb': '', 'version': 1, 'created_by': '', 'modified_date': '',
+            'has_children': False, 'children_count': 0, 'attachments': [],
+            'status': 'current', 'type': 'page', 'hierarchy_depth': 0,
+            'created': '', 'modified': '', 'modified_by': '',
+            'headings': '', 'headings_list': [], 'heading_hierarchy': [],
+            'heading_count': 0, 'parent_titles': []
+        }
 
-    # Status (current, archived, draft)
-    try:
-        # Confluence API может возвращать status в разных местах
-        status = page_data.get('status', 'current')
-        if isinstance(status, str):
-            metadata['status'] = status.lower()
-        else:
-            # Проверяем через _expandable
-            expandable = page_data.get('_expandable', {})
-            if 'status' in expandable:
-                # Status доступен через отдельный запрос, но обычно 'current'
-                metadata['status'] = 'current'
-    except Exception as e:
-        logger.debug(f"Error extracting status: {e}")
+    # 1. Базовые поля (status, type)
+    metadata = _extract_basic_fields(page_data)
 
-    # Type (page, blogpost, attachment)
-    try:
-        page_type = page_data.get('type', 'page')
-        if isinstance(page_type, str):
-            metadata['type'] = page_type.lower()
-    except Exception as e:
-        logger.debug(f"Error extracting type: {e}")
+    # 2. Метки
+    metadata['labels'] = _extract_labels(page_data)
 
-    # Labels (метки) - улучшенная обработка
-    try:
-        labels_data = page_data.get('metadata', {}).get('labels', {})
-        if isinstance(labels_data, dict):
-            labels = labels_data.get('results', [])
-        elif isinstance(labels_data, list):
-            labels = labels_data
-        else:
-            labels = []
-        label_names = [
-            label.get('name', '') for label in labels
-            if isinstance(label, dict) and label.get('name')
-        ]
-        metadata['labels'] = label_names
-    except Exception as e:
-        logger.debug(f"Error extracting labels: {e}")
+    # 3. Иерархия (parents)
+    hierarchy = _extract_hierarchy(page_data)
+    metadata.update(hierarchy)
 
-    # Ancestors (hierarchy) - улучшенная обработка
-    try:
-        ancestors = page_data.get('ancestors', [])
-        parent_titles = []  # ИСПРАВЛЕНО: Инициализируем список
-
-        if ancestors and isinstance(ancestors, list):
-            if len(ancestors) > 0:
-                parent = ancestors[-1]  # Ближайший родитель
-                if isinstance(parent, dict):
-                    metadata['parent_id'] = str(parent.get('id', ''))
-                    metadata['parent_title'] = str(parent.get('title', ''))
-
-            # Hierarchy depth
-            metadata['hierarchy_depth'] = len(ancestors)
-
-            # Извлекаем все parent_titles
-            for ancestor in ancestors:
-                if isinstance(ancestor, dict):
-                    ancestor_title = ancestor.get('title', '')
-                    if ancestor_title:
-                        parent_titles.append(ancestor_title)
-        else:
-            metadata['hierarchy_depth'] = 0
-
-        # Сохраняем parent_titles для удобства
-        metadata['parent_titles'] = parent_titles
-    except Exception as e:
-        logger.debug(f"Error extracting ancestors: {e}")
-        metadata['hierarchy_depth'] = 0
-        metadata['parent_titles'] = []
-
-    # === НОВОЕ: ПОЛНЫЙ ПУТЬ С SPACE (BREADCRUMB) ===
+    # 4. Пути и хлебные крошки
     try:
         current_title = page_data.get('title', '')
         parent_titles = metadata.get('parent_titles', [])
 
-        # ИСПРАВЛЕНО: Используем вспомогательные функции (константы уже определены в начале файла)
-        metadata['breadcrumb'] = build_breadcrumb(
-            space_key,
-            parent_titles,
-            current_title
-        )
-
+        metadata['breadcrumb'] = build_breadcrumb(space_key, parent_titles, current_title)
         metadata['page_path'] = build_page_path(space_key, parent_titles)
     except Exception as e:
-        logger.debug(f"Error building breadcrumb: {e}")
-        current_title = page_data.get('title', '')
-        metadata['breadcrumb'] = f"{space_key} > {current_title}" if current_title else space_key
+        logger.debug(f"Error building paths: {e}")
+        metadata['breadcrumb'] = space_key
         metadata['page_path'] = space_key
 
-    # === НОВОЕ: ИЗВЛЕЧЕНИЕ ВСЕХ ЗАГОЛОВКОВ ИЗ HTML ===
-    try:
-        body = page_data.get('body', {})
-        storage = body.get('storage', {})
-        content_html = storage.get('value', '')
+    # 5. Заголовки из HTML
+    body = page_data.get('body', {})
+    storage = body.get('storage', {})
+    content_html = storage.get('value', '')
+    page_id = page_data.get('id', 'unknown')
 
-        if content_html:
-            # ИСПРАВЛЕНО: Логирование производительности
-            headings_start = time.time()
+    headings_info = _extract_headings_from_html(content_html, page_id)
+    metadata.update(headings_info)
 
-            soup = BeautifulSoup(content_html, 'html.parser')
+    # 6. Версии и даты
+    version_info = _extract_version_info(page_data)
+    metadata.update(version_info)
 
-            # Извлечь все заголовки (h1-h6) с лимитом
-            headings = []
-            heading_hierarchy = []
-            current_path = []
-
-            # ИСПРАВЛЕНО: Используем константу из начала файла
-            MAX_HEADINGS = MAX_HEADINGS_EXTRACT
-
-            for i, heading_tag in enumerate(soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])):
-                # ИСПРАВЛЕНО: Лимит заголовков
-                if i >= MAX_HEADINGS:
-                    logger.debug(f"Truncated headings extraction at {MAX_HEADINGS} for page {page_data.get('id', 'unknown')}")
-                    break
-
-                # ИСПРАВЛЕНО: HTML entities декодирование
-                heading_text = heading_tag.get_text(strip=True)
-                heading_text = html.unescape(heading_text)  # Декодировать &lt; в <
-
-                if not heading_text:
-                    continue
-
-                heading_level = int(heading_tag.name[1])  # h1 -> 1, h2 -> 2, etc.
-
-                headings.append({
-                    'text': heading_text,
-                    'level': heading_level
-                })
-
-                # ИСПРАВЛЕНО: Улучшенная логика иерархии
-                # Обрезать path до текущего уровня
-                while len(current_path) > 0 and len(current_path) >= heading_level:
-                    current_path.pop()
-
-                # ИСПРАВЛЕНО: Дополнить path если пропущены уровни
-                # Если был h1, потом сразу h3, это нормально - просто продолжаем
-                # Не добавляем placeholder, чтобы не искажать структуру
-
-                current_path.append(heading_text)
-                heading_hierarchy.append({
-                    'text': heading_text,
-                    'level': heading_level,
-                    'path': ' > '.join(current_path)
-                })
-
-            # Список всех заголовков (для поиска)
-            all_headings = [h['text'] for h in headings]
-
-            # ИСПРАВЛЕНО: Ограничение длины для headings строки (используем константу)
-            headings_string = ' | '.join(all_headings)
-            if len(headings_string) > MAX_HEADINGS_STRING_LENGTH:
-                # Обрезаем и добавляем "..."
-                truncated = headings_string[:MAX_HEADINGS_STRING_LENGTH]
-                last_pipe = truncated.rfind(' | ')
-                if last_pipe > 0:
-                    headings_string = truncated[:last_pipe] + " | ..."
-                else:
-                    headings_string = truncated + "..."
-
-            metadata['headings'] = headings_string
-            metadata['headings_list'] = all_headings
-            metadata['heading_hierarchy'] = heading_hierarchy
-            metadata['heading_count'] = len(all_headings)
-
-            # ИСПРАВЛЕНО: Логирование производительности
-            headings_time = (time.time() - headings_start) * 1000  # в миллисекундах
-            if headings_time > 100:  # Медленнее 100ms
-                logger.warning(
-                    f"⚠️ Slow headings extraction: {headings_time:.0f}ms "
-                    f"for page {page_data.get('id', 'unknown')} "
-                    f"({metadata['heading_count']} headings, "
-                    f"{len(content_html)} chars HTML)"
-                )
-            elif headings_time > 50:  # Средняя скорость
-                logger.debug(
-                    f"Headings extraction: {headings_time:.0f}ms "
-                    f"for {metadata['heading_count']} headings"
-                )
-        else:
-            metadata['headings'] = ''
-            metadata['headings_list'] = []
-            metadata['heading_hierarchy'] = []
-            metadata['heading_count'] = 0
-    except Exception as e:
-        logger.debug(f"Error extracting headings: {e}")
-        metadata['headings'] = ''
-        metadata['headings_list'] = []
-        metadata['heading_hierarchy'] = []
-        metadata['heading_count'] = 0
-
-    # Version info (created, modified, authors) - улучшенная обработка
-    try:
-        version = page_data.get('version', {})
-        if isinstance(version, dict):
-            metadata['version'] = int(version.get('number', 1))
-
-            modified_when = version.get('when', '')
-            if modified_when:
-                metadata['modified_date'] = str(modified_when)
-                metadata['modified'] = modified_when  # ISO format для фильтрации
-
-            # Modified by
-            by_info = version.get('by', {})
-            if isinstance(by_info, dict):
-                metadata['modified_by'] = str(by_info.get('displayName', ''))
-
-        # History для created date
-        history = page_data.get('history', {})
-        if isinstance(history, dict):
-            created_date = history.get('createdDate', '')
-            if created_date:
-                metadata['created'] = created_date
-            else:
-                # Fallback на version.when если history нет
-                metadata['created'] = metadata.get('modified', '')
-
-        # Created by из history
-        if isinstance(history, dict):
-            created_by_info = history.get('createdBy', {})
-            if isinstance(created_by_info, dict):
-                metadata['created_by'] = str(created_by_info.get('displayName', ''))
-            else:
-                # Fallback на version.by
-                by_info = version.get('by', {})
-                if isinstance(by_info, dict):
-                    metadata['created_by'] = str(by_info.get('displayName', ''))
-    except Exception as e:
-        logger.debug(f"Error extracting version/history info: {e}")
-
-    # Child pages count
+    # 7. Дочерние страницы
     try:
         children_data = page_data.get('children', {})
         if isinstance(children_data, dict):
             page_info = children_data.get('page', {})
-            if isinstance(page_info, dict):
-                children = int(page_info.get('size', 0))
-                metadata['has_children'] = children > 0
-                metadata['children_count'] = children
-    except Exception as e:
-        logger.debug(f"Error extracting children info: {e}")
+            children = int(page_info.get('size', 0) if isinstance(page_info, dict) else 0)
+            metadata['has_children'] = children > 0
+            metadata['children_count'] = children
+        else:
+            metadata['has_children'] = False
+            metadata['children_count'] = 0
+    except Exception:
+        metadata['has_children'] = False
+        metadata['children_count'] = 0
+
+    # Init missing fields
+    metadata.setdefault('attachments', [])
 
     return metadata
 
@@ -740,10 +717,10 @@ def extract_page_metadata(page_data: Dict[str, Any], space_key: str = '') -> Dic
 def extract_macro_body(macro_html: str) -> str:
     """
     Извлечение текста из тела Confluence макроса.
-    
+
     Args:
         macro_html: HTML макроса
-    
+
     Returns:
         Текст из rich-text-body макроса
     """
@@ -757,10 +734,10 @@ def extract_macro_body(macro_html: str) -> str:
 def preprocess_confluence_macros(html: str) -> str:
     """
     Предобработка Confluence макросов для лучшей конвертации в текст.
-    
+
     Args:
         html: HTML с Confluence макросами
-    
+
     Returns:
         HTML с обработанными макросами
     """
@@ -815,7 +792,7 @@ def preprocess_confluence_macros(html: str) -> str:
         code_match = re.search(r'<ac:plain-text-body><!\[CDATA\[(.*?)\]\]></ac:plain-text-body>', full_macro, re.DOTALL)
         code = code_match.group(1) if code_match else extract_macro_body(full_macro)
         return f'\n\n```{language}\n{code}\n```\n\n'
-    
+
     html = re.sub(
         r'<ac:structured-macro[^>]*ac:name="code"[^>]*>.*?</ac:structured-macro>',
         replace_code_macro,
@@ -942,7 +919,7 @@ def convert_table_to_markdown(table_element) -> tuple[str, str]:
                 cells.append(cell_text)
             if cells:
                 rows.append('| ' + ' | '.join(cells) + ' |')
-        
+
         if not rows or len(rows) < 2:
             return "", ""
 
@@ -967,7 +944,7 @@ def extract_list_text(list_element, tag: str) -> str:
             item_text = li.get_text(separator=' ', strip=True)
             if item_text:
                 items.append(item_text)
-        
+
         if not items:
             return ""
 
@@ -1055,133 +1032,95 @@ def extract_structural_blocks(html_content: str) -> List[Dict[str, Any]]:
         text = html_to_text(html_content)
         return [{"type": "text", "content": text, "heading": "", "level": 0, "parent_path": "", "size": len(text)}]
 
+def _create_chunk(block_content, heading, level, block_type, parent_path, size, context_prefix):
+    """Создание структуры чанка."""
+    return {
+        "text": context_prefix + block_content if context_prefix else block_content,
+        "heading": heading,
+        "level": level,
+        "type": block_type,
+        "parent_path": parent_path,
+        "size": size
+    }
+
+def _try_merge_with_last_chunk(chunks, content, heading, max_size, context_prefix):
+    """Попытка объединения с предыдущим чанком."""
+    if not chunks: return False
+    last = chunks[-1]
+    if last.get('heading') != heading or last.get('type') != 'text': return False
+
+    current_len = len(content) + (len(context_prefix) if context_prefix else 0)
+    if last['size'] < 600 and (last['size'] + current_len) <= max_size:
+        new_text = context_prefix + content if context_prefix else content
+        last['text'] += "\n\n" + new_text
+        last['size'] += len("\n\n" + new_text)
+        logger.debug(f"📦 Объединены blocks: {last['size']} chars")
+        return True
+    return False
+
+def _split_large_text_block(content, heading, level, block_type, parent_path, max_size, context_prefix):
+    """Разбиение большого текстового блока."""
+    chunks = []
+
+    # 1. Semantic Splitter
+    if SEMANTIC_SPLITTER and PRESERVE_STRUCTURE:
+        try:
+            text_chunks = SEMANTIC_SPLITTER.split_text(content)
+            for t in text_chunks:
+                if len(t.strip()) < MIN_CHUNK_SIZE: continue
+                chunks.append(_create_chunk(t.strip(), heading, level, block_type, parent_path, len(t), context_prefix))
+            logger.debug(f"✅ Semantic chunking: {len(content)} chars → {len(chunks)} chunks")
+            return chunks
+        except Exception as e:
+            logger.warning(f"Semantic chunking failed: {e}")
+
+    # 2. Fallback (sentence based)
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', content)
+    current = ""
+
+    for sent in sentences:
+        if len(current) + len(sent) + 1 < max_size:
+            current += sent + " "
+        else:
+            if current.strip():
+                chunks.append(_create_chunk(current.strip(), heading, level, block_type, parent_path, len(current), context_prefix))
+            current = sent + " "
+
+    if current.strip():
+        chunks.append(_create_chunk(current.strip(), heading, level, block_type, parent_path, len(current), context_prefix))
+
+    return chunks
+
 def smart_chunk_with_context(blocks: List[Dict[str, Any]], max_size: int = CHUNK_SIZE) -> List[Dict[str, Any]]:
     """Умная нарезка: таблицы и списки целиком, текст по предложениям."""
     chunks = []
 
     for block in blocks:
-        block_type = block['type']
+        b_type = block['type']
         heading = block['heading']
-        level = block['level']
         content = block['content']
-        size = block['size']
-        parent_path = block.get('parent_path', '')
+        parent = block.get('parent_path', '')
 
-        context_prefix = ""
-        if parent_path:
-            context_prefix = f"{parent_path} > {heading}\n\n" if heading else f"{parent_path}\n\n"
-        elif heading:
-            context_prefix = f"{heading}\n\n"
+        prefix = f"{parent} > {heading}\n\n" if parent and heading else (f"{heading}\n\n" if heading else "")
 
-        if block_type in ['table', 'list']:
-            chunk = {
-                "text": context_prefix + content if context_prefix else content,
-                "heading": heading,
-                "level": level,
-                "type": block_type,
-                "parent_path": parent_path,
-                "size": size
-            }
-            if block_type == 'table' and 'html' in block:
-                chunk['html'] = block['html']
+        if b_type in ['table', 'list']:
+            chunk = _create_chunk(content, heading, block['level'], b_type, parent, block['size'], prefix)
+            if b_type == 'table' and 'html' in block: chunk['html'] = block['html']
             chunks.append(chunk)
-            logger.info(f"✓ {block_type.capitalize()} block (size={size} chars): '{heading}' in {parent_path or 'root'}")
+            logger.info(f"✓ {b_type.capitalize()} block: '{heading}'")
             continue
 
-        if block_type == 'text':
-            if size <= max_size:
-                # КРИТИЧНО: Объединяем маленькие blocks под одним heading
-                if chunks and chunks[-1].get('heading') == heading and chunks[-1].get('type') == 'text':
-                    last_chunk = chunks[-1]
-                    last_size = last_chunk.get('size', 0)
-
-                    # Если предыдущий chunk маленький (< 600 chars) и вместе они < max_size - объединяем
-                    combined_size = last_size + size + len(context_prefix)
-                    if last_size < 600 and combined_size <= max_size:
-                        # Объединяем chunks
-                        new_content = context_prefix + content if context_prefix else content
-                        combined_text = last_chunk['text'] + "\n\n" + new_content
-                        last_chunk['text'] = combined_text
-                        last_chunk['size'] = len(combined_text)
-                        logger.debug(f"📦 Объединены blocks: {last_size} + {size} = {len(combined_text)} chars под heading '{heading}'")
-                        continue  # Пропускаем создание нового chunk
-
-                # Создаём новый chunk
-                chunk = {
-                    "text": context_prefix + content if context_prefix else content,
-                    "heading": heading,
-                    "level": level,
-                    "type": block_type,
-                    "parent_path": parent_path,
-                    "size": size
-                }
-                chunks.append(chunk)
+        if b_type == 'text':
+            if block['size'] <= max_size:
+                if not _try_merge_with_last_chunk(chunks, content, heading, max_size, prefix):
+                    chunks.append(_create_chunk(content, heading, block['level'], b_type, parent, block['size'], prefix))
             else:
-                logger.info(f"⚠ Text block too large ({size} > {max_size}), splitting: '{heading}'")
+                logger.info(f"⚠ Splitting large text block ({block['size']} chars)")
+                sub_chunks = _split_large_text_block(content, heading, block['level'], b_type, parent, max_size, prefix)
+                chunks.extend(sub_chunks)
 
-                # === НОВОЕ: Использовать RecursiveCharacterTextSplitter если доступен ===
-                if SEMANTIC_SPLITTER and PRESERVE_STRUCTURE:
-                    try:
-                        # Semantic chunking с сохранением структуры
-                        text_chunks = SEMANTIC_SPLITTER.split_text(content)
-
-                        for i, chunk_text in enumerate(text_chunks):
-                            if len(chunk_text.strip()) < MIN_CHUNK_SIZE:
-                                continue
-
-                            chunk = {
-                                "text": context_prefix + chunk_text.strip() if context_prefix else chunk_text.strip(),
-                                "heading": heading,
-                                "level": level,
-                                "type": block_type,
-                                "parent_path": parent_path,
-                                "size": len(chunk_text)
-                            }
-                            chunks.append(chunk)
-
-                        logger.debug(f"✅ Semantic chunking: {size} chars → {len(text_chunks)} chunks")
-                        continue
-                    except Exception as e:
-                        logger.warning(f"Semantic chunking failed, using fallback: {e}")
-
-                # Fallback: existing sentence-based splitting
-                import re
-                sentences = re.split(r'(?<=[.!?])\s+', content)
-                current = ""
-                overlap_buffer = ""
-
-                for sent in sentences:
-                    if len(current) + len(sent) + 1 < max_size:
-                        current += sent + " "
-                    else:
-                        if current.strip():
-                            chunk_text = context_prefix + (overlap_buffer + current).strip() if context_prefix else (overlap_buffer + current).strip()
-                            chunk = {
-                                "text": chunk_text,
-                                "heading": heading,
-                                "level": level,
-                                "type": block_type,
-                                "parent_path": parent_path,
-                                "size": len(chunk_text)
-                            }
-                            chunks.append(chunk)
-                            overlap_buffer = current[-CHUNK_OVERLAP_SIZE:] if len(current) > CHUNK_OVERLAP_SIZE else current
-                        current = sent + " "
-
-                if current.strip():
-                    chunk_text = context_prefix + (overlap_buffer + current).strip() if context_prefix else (overlap_buffer + current).strip()
-                    chunk = {
-                        "text": chunk_text,
-                        "heading": heading,
-                        "level": level,
-                        "type": block_type,
-                        "parent_path": parent_path,
-                        "size": len(chunk_text)
-                    }
-                    chunks.append(chunk)
-
-    return chunks if chunks else []
-
+    return chunks
 
 def html_to_text(html: str, max_len: int = 50000) -> str:
     """
@@ -1190,7 +1129,7 @@ def html_to_text(html: str, max_len: int = 50000) -> str:
     Args:
         html: HTML контент
         max_len: Максимальная длина для обработки
-    
+
     Returns:
         Plain text или пустая строка при ошибке
     """
@@ -1216,7 +1155,7 @@ def html_to_text(html: str, max_len: int = 50000) -> str:
         h.mark_code = True  # Отмечать код блоки
         h.wrap_links = False  # Не переносить ссылки
         h.default_image_alt = "[Изображение]"  # Альт для изображений
-        
+
         text = h.handle(html).strip()
 
         # Очистка множественных пустых строк (больше 2 подряд)
@@ -1244,7 +1183,7 @@ def extract_sections(text: str) -> List[Dict[str, Any]]:
     heading_stack = []  # Стек заголовков для отслеживания иерархии
 
     heading_pattern = re.compile(r'^(#{1,6})\s+(.+)$')
-    
+
     for line in lines:
         match = heading_pattern.match(line)
         if match:
@@ -1255,7 +1194,7 @@ def extract_sections(text: str) -> List[Dict[str, Any]]:
             # Начинаем новую секцию
             level = len(match.group(1))
             heading = match.group(2).strip()
-            
+
             # Обновляем стек заголовков: удаляем все заголовки того же или более низкого уровня
             heading_stack = [h for h in heading_stack if h['level'] < level]
 
@@ -1272,13 +1211,44 @@ def extract_sections(text: str) -> List[Dict[str, Any]]:
             heading_stack.append({'level': level, 'text': heading})
         else:
             current_section["content"].append(line)
-    
+
     # Сохраняем последнюю секцию
     if current_section["content"]:
         sections.append(current_section)
 
     return sections
 
+def _chunk_from_sections(sections, size):
+    """Разбиение секций на чанки."""
+    chunks = []
+    for section in sections:
+        heading = section["heading"]
+        level = section["level"]
+        parent_headings = section.get("parent_headings", [])
+        content = '\n'.join(section["content"])
+
+        context_prefix = ""
+        if level >= 3 and parent_headings:
+            context_prefix = " > ".join(parent_headings) + "\n\n"
+
+        if len(content) <= size:
+            text = context_prefix + content.strip() if context_prefix else content.strip()
+            chunks.append({"text": text, "heading": heading, "level": level})
+        else:
+            paras = [p.strip() for p in content.split('\n\n') if p.strip()]
+            current = ""
+            for para in paras:
+                if len(current) + len(para) + 2 < size:
+                    current += para + "\n\n"
+                else:
+                    if current.strip():
+                        text = context_prefix + current.strip() if context_prefix else current.strip()
+                        chunks.append({"text": text, "heading": heading, "level": level})
+                    current = para + "\n\n"
+            if current.strip():
+                text = context_prefix + current.strip() if context_prefix else current.strip()
+                chunks.append({"text": text, "heading": heading, "level": level})
+    return chunks
 
 def chunk_text(text: str, size: int = CHUNK_SIZE) -> List[Dict[str, Any]]:
     """
@@ -1297,68 +1267,22 @@ def chunk_text(text: str, size: int = CHUNK_SIZE) -> List[Dict[str, Any]]:
     # Извлекаем секции по заголовкам
     sections = extract_sections(text)
 
-    if not sections:
-        # Fallback: разбиение по параграфам
-        paras = [p.strip() for p in text.split('\n\n') if p.strip() and len(p.strip()) > 5]
-        chunks = []
-        current = ""
-        for para in paras:
-            if len(current) + len(para) + 2 < size:
-                current += para + "\n\n"
-            else:
-                if current.strip():
-                    chunks.append({"text": current.strip(), "heading": "", "level": 0})
-                current = para + "\n\n"
-        if current.strip():
-            chunks.append({"text": current.strip(), "heading": "", "level": 0})
-        return chunks if chunks else [{"text": text, "heading": "", "level": 0}]
+    if sections:
+        return _chunk_from_sections(sections, size) or [{"text": text, "heading": "", "level": 0}]
 
-    # Разбиваем секции на чанки
+    # Fallback: разбиение по параграфам
+    paras = [p.strip() for p in text.split('\n\n') if p.strip() and len(p.strip()) > 5]
     chunks = []
-    for section in sections:
-        heading = section["heading"]
-        level = section["level"]
-        parent_headings = section.get("parent_headings", [])
-        content = '\n'.join(section["content"])
-
-        # Формируем префикс из родительских заголовков (только для уровня 3+)
-        context_prefix = ""
-        if level >= 3 and parent_headings:
-            # Добавляем родительские заголовки для контекста
-            context_prefix = " > ".join(parent_headings) + "\n\n"
-
-        # Если секция целиком влезает в чанк
-        if len(content) <= size:
-            chunk_text = context_prefix + content.strip() if context_prefix else content.strip()
-            chunks.append({
-                "text": chunk_text,
-                "heading": heading,
-                "level": level
-            })
+    current = ""
+    for para in paras:
+        if len(current) + len(para) + 2 < size:
+            current += para + "\n\n"
         else:
-            # Разбиваем большую секцию по параграфам, сохраняя заголовок
-            paras = [p.strip() for p in content.split('\n\n') if p.strip()]
-            current = ""
-            for para in paras:
-                if len(current) + len(para) + 2 < size:
-                    current += para + "\n\n"
-                else:
-                    if current.strip():
-                        chunk_text = context_prefix + current.strip() if context_prefix else current.strip()
-                        chunks.append({
-                            "text": chunk_text,
-                            "heading": heading,
-                            "level": level
-                        })
-                    current = para + "\n\n"
             if current.strip():
-                chunk_text = context_prefix + current.strip() if context_prefix else current.strip()
-                chunks.append({
-                    "text": chunk_text,
-                    "heading": heading,
-                    "level": level
-                })
-
+                chunks.append({"text": current.strip(), "heading": "", "level": 0})
+            current = para + "\n\n"
+    if current.strip():
+        chunks.append({"text": current.strip(), "heading": "", "level": 0})
     return chunks if chunks else [{"text": text, "heading": "", "level": 0}]
 
 
@@ -1418,7 +1342,7 @@ def get_all_pages_generator(confluence: Confluence, space_key: str, batch_size: 
     """
     start = 0
     total_yielded = 0
-    
+
     while True:
         try:
             logger.debug(f"Fetching pages from {space_key} starting at {start}")
@@ -1430,7 +1354,7 @@ def get_all_pages_generator(confluence: Confluence, space_key: str, batch_size: 
                 limit=batch_size,
                 expand='history.lastUpdated,version.number'
             ))
-            
+
             if not batch:
                 logger.info(f"No more pages for {space_key}. Total yielded: {total_yielded}")
                 break
@@ -1464,15 +1388,160 @@ class BatchProcessor:
 
     def __init__(self, max_retries: int = 3):
         self.max_retries = max_retries
-        # ✅ ИСПРАВЛЕНИЕ: Используем Bloom Filter для больших объемов данных
         if USE_BLOOM_FILTER and HAS_BLOOM_FILTER:
             self.processed_ids = BloomFilter(capacity=BLOOM_FILTER_SIZE, error_rate=0.001)
             self._use_bloom = True
             logger.debug(f"Using Bloom Filter for duplicate detection (capacity={BLOOM_FILTER_SIZE})")
         else:
-            self.processed_ids = set()  # Fallback на set() для малых объемов
+            self.processed_ids = set()
             self._use_bloom = False
-        self.failed_ids = {}  # Неудачные с причиной
+        self.failed_ids = {}
+
+    def _parse_updated_at(self, page_data: Dict[str, Any]) -> datetime:
+        """Парсинг даты обновления."""
+        try:
+            version_when = page_data.get('version', {}).get('when', '')
+            if version_when:
+                if version_when.endswith('Z'):
+                    version_when = version_when[:-1] + '+00:00'
+                return datetime.fromisoformat(version_when)
+        except Exception as e:
+            logger.debug(f"Ошибка парсинга даты: {e}")
+        return datetime.now()
+
+    def _prepare_chunk_metadata(self, chunk: dict, chunk_idx: int, page_id: str, title: str,
+                              page_metadata: dict, space_key: str) -> dict:
+        """Подготовка метаданных для чанка."""
+        chunk_content = chunk.get('text', '')
+
+        # Ограничиваем длину полей
+        max_str_len = 500
+        labels_list = page_metadata.get('labels', [])
+        labels_safe = ",".join(labels_list)[:max_str_len]
+
+        # Базовые метаданные
+        metadata = {
+            "page_id": page_id,
+            "chunk": chunk_idx,
+            "title": title[:max_str_len] if title else "Unknown",
+            "space": space_key,
+            "url": f"{CONFLUENCE_URL}pages/viewpage.action?pageId={page_id}",
+            "text": chunk_content,  # КРИТИЧНО для payload
+
+            # Структура
+            "heading": chunk.get('heading', '')[:max_str_len],
+            "heading_level": chunk.get('level', 0),
+            "type": chunk.get('type', 'text'),
+            "parent_path": chunk.get('parent_path', '')[:max_str_len],
+            "block_size": chunk.get('size', 0),
+
+            # Confluence
+            "labels": labels_safe,
+            "parent_title": page_metadata.get('parent_title', '')[:max_str_len],
+            "page_path": page_metadata.get('page_path', '')[:200],
+            "breadcrumb": page_metadata.get('breadcrumb', '')[:200],
+            "created_by": page_metadata.get('created_by', '')[:max_str_len],
+            "version": page_metadata.get('version', 1),
+
+            # Фильтрация
+            "status": page_metadata.get('status', 'current'),
+            "content_type": page_metadata.get('type', 'page'),
+            "hierarchy_depth": page_metadata.get('hierarchy_depth', 0),
+            "created": page_metadata.get('created', ''),
+            "modified": page_metadata.get('modified', ''),
+        }
+
+        return sanitize_metadata(metadata)
+
+    def _index_chunks(self, page_id: str, title: str, chunks: list, page_metadata: dict,
+                     space_key: str, qdrant_client: Any):
+        """Индексация чанков в Qdrant."""
+        # Удаляем старые
+        try:
+            delete_points_by_page_id(page_id)
+        except Exception as e:
+            logger.warning(f"Ошибка удаления старых чанков для {page_id}: {e}")
+
+        # Подготавливаем чанки
+        valid_chunks = []
+        for i, chunk in enumerate(chunks):
+            if not chunk.get('text') or len(chunk['text']) < 20:
+                continue
+
+            metadata = self._prepare_chunk_metadata(chunk, i, page_id, title, page_metadata, space_key)
+            valid_chunks.append({
+                'text': chunk['text'],
+                'metadata': metadata,
+                'point_id': f"{page_id}_{i}"
+            })
+
+        if not valid_chunks:
+            return
+
+        # Генерируем эмбеддинги батчем
+        texts = [c['text'] for c in valid_chunks]
+        try:
+            embeddings = generate_query_embeddings_batch(texts)
+            for i, chunk in enumerate(valid_chunks):
+                chunk['embedding'] = embeddings[i]
+        except Exception:
+            # Fallback: по одному
+            for chunk in valid_chunks:
+                chunk['embedding'] = generate_query_embedding(chunk['text'])
+
+        # Вставка в Qdrant
+        chunks_to_insert = valid_chunks
+        if len(chunks_to_insert) > BATCH_INSERT_THRESHOLD:
+            success, failed = insert_chunks_batch_to_qdrant(qdrant_client, chunks_to_insert, batch_size=100)
+            if failed > 0:
+                 logger.warning(f"Failed to insert {failed} chunks for {page_id}")
+        else:
+            for chunk in chunks_to_insert:
+                insert_chunk_to_qdrant(
+                    client=qdrant_client, chunk_text=chunk['text'],
+                    metadata=chunk['metadata'], embedding=chunk['embedding'],
+                    point_id=chunk['point_id']
+                )
+
+    def _process_page_logic(self, page_id: str, title: str, qdrant_client: Any,
+                          confluence: Confluence, space_key: str) -> bool:
+        """Логика обработки одной страницы (без retry и проверок состояния)."""
+        # 1. Получение и метаданные
+        page_data = get_page_cached(confluence, page_id)
+        page_metadata = extract_page_metadata(page_data, space_key=space_key)
+        page_metadata['attachments'] = get_page_attachments(confluence, page_id)
+
+        html = page_data.get('body', {}).get('storage', {}).get('value', '')
+        if not html or len(html) < MIN_TEXT_LEN:
+            return False
+
+        # 2. Нарезка
+        blocks = extract_structural_blocks(html)
+        if not blocks:
+            return False
+        chunks = smart_chunk_with_context(blocks, max_size=CHUNK_SIZE)
+
+        # 3. Postgres
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = False
+        content_markdown = h.handle(html)
+
+        updated_at = self._parse_updated_at(page_data)
+
+        if not save_page_to_postgres(
+            page_id=page_id, space_key=space_key, title=title,
+            content_html=html, content_markdown=content_markdown,
+            version=page_data.get('version', {}).get('number', 1),
+            metadata=page_metadata, updated_at=updated_at
+        ):
+            logger.warning(f"Не удалось сохранить страницу {page_id} в PostgreSQL")
+            return False
+
+        # 4. Qdrant
+        self._index_chunks(page_id, title, chunks, page_metadata, space_key, qdrant_client)
+
+        return True
 
     def process_batch_safe(
         self,
@@ -1484,8 +1553,6 @@ class BatchProcessor:
     ) -> tuple[int, int, int, list]:
         """
         Процессировать батч с гарантией целостности.
-        
-        Если ошибка → откатывает только эту страницу, не весь батч.
         """
         updated, errors, skipped = 0, 0, 0
         error_details = []
@@ -1493,172 +1560,59 @@ class BatchProcessor:
         for page in batch:
             page_id = str(page.get('id', ''))
             if not page_id:
-                skipped += 1
-                continue
+                skipped += 1; continue
 
             title = page.get('title', 'Unknown')
             ts = get_timestamp(page)
 
-            # ✅ ИСПРАВЛЕНИЕ: Пропускаем если уже обработана (Bloom Filter или set())
+            # Проверка дубликатов и состояния
             if page_id in self.processed_ids:
-                skipped += 1
-                continue
+                skipped += 1; continue
 
-            # Пропускаем если не изменилась
             if page_id in state['pages'] and state['pages'][page_id].get('updated') == ts:
-                skipped += 1
-                continue
+                skipped += 1; continue
 
             try:
-                # Пытаемся обработать с retry
+                # Retry logic
+                success = False
                 for attempt in range(self.max_retries):
                     try:
-                        # Получаем полную страницу (с кэшированием)
-                        page_data = get_page_cached(confluence, page_id)
-
-                        # Извлечение расширенных метаданных
-                        page_metadata = extract_page_metadata(page_data, space_key=space_key)
-                        page_metadata['attachments'] = get_page_attachments(confluence, page_id)
-
-                        html = page_data.get('body', {}).get('storage', {}).get('value', '')
-                        if not html or len(html) < MIN_TEXT_LEN:
-                            skipped += 1
-                            break
-
-                        # Структурная нарезка
-                        blocks = extract_structural_blocks(html)
-                        if not blocks:
-                            skipped += 1
-                            break
-
-                        chunks = smart_chunk_with_context(blocks, max_size=CHUNK_SIZE)
-
-                        # Конвертируем HTML в markdown
-                        h = html2text.HTML2Text()
-                        h.ignore_links = False
-                        h.ignore_images = False
-                        content_markdown = h.handle(html)
-
-                        # Сохраняем в PostgreSQL
-                        try:
-                            version_when = page_data.get('version', {}).get('when', '')
-                            if version_when:
-                                if version_when.endswith('Z'):
-                                    version_when = version_when[:-1] + '+00:00'
-                                updated_at = datetime.fromisoformat(version_when)
-                            else:
-                                updated_at = datetime.now()
-                        except Exception as e:
-                            logger.debug(f"Ошибка парсинга даты для {page_id}: {e}")
-                            updated_at = datetime.now()
-
-                        if not save_page_to_postgres(
-                            page_id=page_id,
-                            space_key=space_key,
-                            title=title,
-                            content_html=html,
-                            content_markdown=content_markdown,
-                            version=page_data.get('version', {}).get('number', 1),
-                            metadata=page_metadata,
-                            updated_at=updated_at
-                        ):
-                            logger.warning(f"Не удалось сохранить страницу {page_id} в PostgreSQL")
-                            skipped += 1
-                            break
-
-                        # Удаляем старые чанки из Qdrant
-                        try:
-                            delete_points_by_page_id(page_id)
-                        except Exception as e:
-                            logger.warning(f"Ошибка удаления старых чанков для {page_id}: {e}")
-
-                        # Индексируем чанки в Qdrant
-                        for chunk_idx, chunk in enumerate(chunks):
-                            chunk_text = chunk.get('text', '')
-                            if not chunk_text:
-                                continue
-
-                            # Санитизация метаданных перед сохранением
-                            # КРИТИЧНО: Добавляем text в metadata для совместимости
-                            sanitized_metadata = sanitize_metadata({
-                                'text': chunk_text,  # КРИТИЧНО: текст должен быть в metadata для сохранения в payload
-                                'page_id': page_id,
-                                'chunk': chunk_idx,
-                                'chunk_type': chunk.get('type', 'text'),
-                                'heading': chunk.get('heading', '')[:200],  # Обрезаем заголовки
-                                'heading_level': chunk.get('level', 0),
-                                'parent_path': chunk.get('parent_path', '')[:200],
-                                'space': space_key,
-                                'title': title[:200] if title else '',  # Обрезаем title
-                                'url': f"{CONFLUENCE_URL}pages/viewpage.action?pageId={page_id}",
-                                # Включаем только необходимые поля из page_metadata
-                                'created': page_metadata.get('created', ''),
-                                'modified': page_metadata.get('modified', ''),
-                                'author': page_metadata.get('author', ''),
-                                'space_key': page_metadata.get('space_key', space_key),
-                                # НЕ включаем полный HTML, breadcrumb, headings_list и т.д.!
-                            })
-                            
-                            # Генерируем embedding для chunk
-                            embedding = generate_query_embedding(chunk_text)
-                            point_id = f"{page_id}_{chunk_idx}"
-
-                            # Вставляем напрямую в Qdrant
-                            success = insert_chunk_to_qdrant(
-                                client=qdrant_client,
-                                chunk_text=chunk_text,
-                                metadata=sanitized_metadata,
-                                embedding=embedding,
-                                point_id=point_id
-                            )
-                            if not success:
-                                logger.warning(f"Failed to insert chunk {point_id} for page {page_id}")
-                        
-                        # Обновляем состояние
-                        state['pages'][page_id] = {'updated': ts, 'title': title}
-
-                        # Помечаем как проиндексированную в PostgreSQL
-                        mark_as_indexed(page_id)
-
-                        # ✅ Добавляем в Bloom Filter или set()
-                        if self._use_bloom:
+                        if self._process_page_logic(page_id, title, qdrant_client, confluence, space_key):
+                            state['pages'][page_id] = {'updated': ts, 'title': title}
+                            mark_as_indexed(page_id)
                             self.processed_ids.add(page_id)
+                            updated += 1
+                            success = True
                         else:
-                            self.processed_ids.add(page_id)
-                        updated += 1
-                        break  # Успешно обработано
-
-                    except Exception as retry_error:
+                            skipped += 1
+                        break # Success
+                    except Exception as retry_err:
                         if attempt < self.max_retries - 1:
-                            wait_time = 2 ** attempt
-                            logger.warning(f"Retry {attempt + 1}/{self.max_retries} for page {page_id}: {retry_error}. Waiting {wait_time}s...")
-                            time.sleep(wait_time)  # Exponential backoff
+                            wait = 2 ** attempt
+                            logger.warning(f"Retry {attempt+1} for {page_id}: {retry_err}. Wait {wait}s")
+                            time.sleep(wait)
                         else:
                             raise
-                
+
             except Exception as e:
-                # Ошибка на странице, но продолжаем батч
-                error_msg = f"Не удалось обработать страницу {page_id} ({title}): {e}"
+                error_msg = f"Error processing {page_id} ({title}): {e}"
                 logger.error(error_msg)
                 self.failed_ids[page_id] = str(e)
                 errors += 1
                 error_details.append({
-                    "page_id": page_id,
-                    "title": title,
-                    "error": str(e),
-                    "timestamp": datetime.now().isoformat()
+                    "page_id": page_id, "title": title,
+                    "error": str(e), "timestamp": datetime.now().isoformat()
                 })
-        
+
         return updated, errors, skipped, error_details
 
     def get_stats(self) -> Dict[str, Any]:
         """Получить статистику обработки"""
-        # ✅ Для Bloom Filter используем приблизительный размер
         if self._use_bloom:
-            processed_count = self.processed_ids.count  # Приблизительное количество
+            processed_count = self.processed_ids.count
         else:
             processed_count = len(self.processed_ids)
-        
+
         return {
             "processed": processed_count,
             "failed": len(self.failed_ids),
@@ -1670,266 +1624,11 @@ class BatchProcessor:
 def process_batch(qdrant_client: Any, confluence: Confluence,
                   pages: List[Dict[str, Any]], state: Dict[str, Any], space_key: str) -> tuple[int, int, int, list]:
     """
-    Обработка batch страниц Confluence.
-    Сохраняет страницы в PostgreSQL, затем индексирует в Qdrant.
-
-    Args:
-        qdrant_client: Qdrant клиент
-        confluence: Confluence API client
-        pages: Список страниц для обработки
-        state: Состояние синхронизации
-        space_key: Ключ пространства
-
-    Returns:
-        Tuple[updated, errors, skipped, error_details] - статистика обработки
+    Legacy wrapper for backward compatibility.
+    Использует BatchProcessor для обработки.
     """
-    # Тестовый режим
-    if TEST_MODE:
-        pages = pages[:TEST_MAX_PAGES]
-        logger.info(f"🧪 TEST MODE ENABLED - Processing only first {len(pages)} pages")
-    
-    updated, errors, skipped = 0, 0, 0
-    error_details = []  # Список деталей ошибок
-    for page in pages:
-        pid = str(page.get('id', ''))
-        if not pid:
-            skipped += 1
-            continue
-        title = page.get('title', 'Unknown')
-        ts = get_timestamp(page)
-        try:
-            if pid in state['pages'] and state['pages'][pid].get('updated') == ts:
-                skipped += 1
-                continue
-            try:
-                page_data = get_page(confluence, pid)
-            except Exception as e:
-                error_msg = f"Не удалось получить страницу {pid} ({title}): {e}"
-                logger.warning(error_msg)
-                error_details.append(error_msg)
-                skipped += 1
-                continue
-
-            # Извлечение расширенных метаданных
-            page_metadata = extract_page_metadata(page_data, space_key=space_key)
-
-            # Получаем список вложений
-            page_metadata['attachments'] = get_page_attachments(confluence, pid)
-
-            html = page_data.get('body', {}).get('storage', {}).get('value', '')
-            if not html or len(html) < MIN_TEXT_LEN:
-                skipped += 1
-                continue
-            
-            # Структурная нарезка
-            blocks = extract_structural_blocks(html)
-            if not blocks:
-                skipped += 1
-                continue
-
-            chunks = smart_chunk_with_context(blocks, max_size=CHUNK_SIZE)
-
-            # Конвертируем HTML в markdown для хранения
-            h = html2text.HTML2Text()
-            h.ignore_links = False
-            h.ignore_images = False
-            content_markdown = h.handle(html)
-
-            # Сохраняем страницу в PostgreSQL
-            try:
-                version_when = page_data.get('version', {}).get('when', '')
-                if version_when:
-                    # Парсим ISO формат даты
-                    if version_when.endswith('Z'):
-                        version_when = version_when[:-1] + '+00:00'
-                    updated_at = datetime.fromisoformat(version_when)
-                else:
-                    updated_at = datetime.now()
-            except Exception as e:
-                logger.debug(f"Ошибка парсинга даты для {pid}: {e}, использую текущую дату")
-                updated_at = datetime.now()
-
-            if not save_page_to_postgres(
-                page_id=pid,
-                space_key=space_key,
-                title=title,
-                content_html=html,
-                content_markdown=content_markdown,
-                version=page_data.get('version', {}).get('number', 1),
-                metadata=page_metadata,
-                updated_at=updated_at
-            ):
-                logger.warning(f"Не удалось сохранить страницу {pid} в PostgreSQL")
-                skipped += 1
-                continue
-
-            # Удаляем старые чанки из Qdrant
-            try:
-                delete_points_by_page_id(pid)
-            except Exception as e:
-                logger.debug(f"Не удалось удалить старые чанки для {pid}: {e}")
-
-            # Собираем все chunks для batch вставки
-            chunks_to_insert = []
-            page_url = f"{CONFLUENCE_URL.rstrip('/')}/wiki/spaces/{space_key}/pages/{pid}"
-
-            # Полные метаданные: базовые + заголовки + Confluence метаданные
-            labels_list = page_metadata.get('labels', [])
-            labels_str = ",".join(labels_list) if labels_list else ""
-
-            attachments_list = page_metadata.get('attachments', [])
-            attachments_str = ",".join(attachments_list) if attachments_list else ""
-            
-            # Ограничиваем длину строковых полей (для совместимости с Qdrant)
-            max_str_len = 500
-            title_safe = title[:max_str_len] if title else "Unknown"
-            parent_safe = page_metadata.get('parent_title', '')[:max_str_len]
-            author_safe = page_metadata.get('created_by', '')[:max_str_len]
-            attachments_safe = attachments_str[:max_str_len]
-            page_path_safe = page_metadata.get('page_path', '')[:max_str_len]
-            breadcrumb_safe = page_metadata.get('breadcrumb', '')[:max_str_len]
-
-            # Сначала собираем все валидные chunks с метаданными
-            valid_chunks_data = []
-            for i, chunk_data in enumerate(chunks):
-                # chunk_data теперь словарь с ключами: text, heading, level
-                if not isinstance(chunk_data, dict):
-                    logger.warning(f"Unexpected chunk_data type: {type(chunk_data)}")
-                    continue
-                
-                chunk_content = chunk_data.get("text", "")
-                if not chunk_content or len(chunk_content) < 20:
-                    continue
-
-                heading_safe = chunk_data.get("heading", "")[:max_str_len]
-                labels_safe = labels_str[:max_str_len]
-                parent_path_safe = chunk_data.get("parent_path", "")[:max_str_len]
-
-                # Обогащенные метаданные
-                block_type = chunk_data.get("type", "text")
-                block_size = chunk_data.get("size", 0)
-                is_complete = block_type in ["table", "list"]
-                heading_path = (parent_path_safe + " > " + heading_safe if parent_path_safe else heading_safe)[:max_str_len]
-                
-                metadata = {
-                    # Базовые
-                    "page_id": pid,
-                    "chunk": i,
-                    "title": title_safe,
-                    "space": space_key,
-                    "url": page_url,
-                    # Структура документа
-                    "heading": heading_safe,
-                    "heading_level": chunk_data.get("level", 0),
-                    # НОВЫЕ ПОЛЯ для структурной нарезки
-                    "type": block_type,                          # table|list|text (тип блока)
-                    "parent_path": parent_path_safe,             # Иерархия заголовков
-                    "block_size": block_size,                    # Размер блока
-                    "is_complete_block": is_complete,            # Целый блок или часть
-                    "has_table": block_type == "table",          # Содержит таблицу
-                    "heading_path": heading_path,                # Полный путь
-                    # Confluence метаданные
-                    "labels": labels_safe,
-                    "parent_title": parent_safe,                 # Родительская страница (ближайший)
-                    "page_path": page_path_safe[:200] if page_path_safe else '',  # URL-friendly путь (ограниченный)
-                    "breadcrumb": breadcrumb_safe[:200] if breadcrumb_safe else '',  # Полный путь с разделителями (ограниченный)
-                    "created_by": author_safe,
-                    "has_children": page_metadata.get('has_children', False),
-                    "version": page_metadata.get('version', 1),
-                    "attachments": attachments_safe[:10] if attachments_safe else [],  # Ограничиваем список вложений
-                    # НОВЫЕ ПОЛЯ для metadata filtering (из extract_page_metadata):
-                    "status": page_metadata.get('status', 'current'),  # current, archived, draft
-                    "content_type": page_metadata.get('type', 'page'),  # page, blogpost, attachment
-                    "hierarchy_depth": page_metadata.get('hierarchy_depth', 0),
-                    "created": page_metadata.get('created', ''),
-                    "modified": page_metadata.get('modified', ''),
-                    "modified_by": page_metadata.get('modified_by', ''),
-                    "children_count": page_metadata.get('children_count', 0),
-                    # === ПУТЬ И ЗАГОЛОВКИ (ограниченные) ===
-                    "headings": (page_metadata.get('headings', '') or '')[:500],  # Обрезаем headings
-                    "headings_list": (page_metadata.get('headings_list', []) or [])[:10],  # Ограничиваем список
-                    "heading_count": page_metadata.get('heading_count', 0)
-                }
-
-                # Санитизация метаданных перед сохранением
-                # КРИТИЧНО: Добавляем text в metadata, т.к. LlamaIndex QdrantVectorStore 
-                # не сохраняет Document.text в payload автоматически
-                metadata['text'] = chunk_content  # КРИТИЧНО: текст должен быть в metadata для сохранения в payload
-                sanitized_metadata = sanitize_metadata(metadata)
-
-                valid_chunks_data.append({
-                    'index': i,
-                    'text': chunk_content,
-                    'metadata': sanitized_metadata,
-                    'point_id': f"{pid}_{i}"
-                })
-
-            # Оптимизация: генерируем embeddings батчем (3-5x быстрее)
-            if valid_chunks_data:
-                chunk_texts = [chunk['text'] for chunk in valid_chunks_data]
-                try:
-                    embeddings = generate_query_embeddings_batch(chunk_texts)
-                    # Присваиваем embeddings каждому chunk
-                    for chunk, embedding in zip(valid_chunks_data, embeddings):
-                        chunks_to_insert.append({
-                            'text': chunk['text'],
-                            'metadata': chunk['metadata'],
-                            'embedding': embedding,
-                            'point_id': chunk['point_id']
-                        })
-                except Exception as e:
-                    logger.warning(f"Batch embedding generation failed for page {pid}, falling back to single: {e}")
-                    # Fallback: генерируем по одному
-                    for chunk in valid_chunks_data:
-                        try:
-                            embedding = generate_query_embedding(chunk['text'])
-                            chunks_to_insert.append({
-                                'text': chunk['text'],
-                                'metadata': chunk['metadata'],
-                                'embedding': embedding,
-                                'point_id': chunk['point_id']
-                            })
-                        except Exception as e2:
-                            logger.warning(f"Failed to generate embedding for chunk {chunk['point_id']}: {e2}")
-                            continue
-
-            # Batch вставка (если chunks > BATCH_INSERT_THRESHOLD) или single
-            inserted = 0
-            if len(chunks_to_insert) > BATCH_INSERT_THRESHOLD:
-                success_count, error_count = insert_chunks_batch_to_qdrant(
-                    client=qdrant_client,
-                    chunks_data=chunks_to_insert,
-                    batch_size=100
-                )
-                inserted = success_count
-                if error_count > 0:
-                    logger.warning(f"Failed to insert {error_count} chunks for page {pid}")
-            else:
-                for chunk_data in chunks_to_insert:
-                    success = insert_chunk_to_qdrant(
-                        client=qdrant_client,
-                        chunk_text=chunk_data['text'],
-                        metadata=chunk_data['metadata'],
-                        embedding=chunk_data['embedding'],
-                        point_id=chunk_data['point_id']
-                    )
-                    if success:
-                        inserted += 1
-            if inserted > 0:
-                state['pages'][pid] = {'updated': ts, 'chunks': inserted}
-                # Помечаем страницу как проиндексированную в PostgreSQL
-                mark_as_indexed(pid)
-                updated += 1
-            else:
-                skipped += 1
-        except Exception as e:
-            import traceback
-            error_msg = f"Error processing page {pid} ({title}): {e}"
-            logger.error(error_msg)
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            error_details.append(error_msg)
-            errors += 1
-    return updated, errors, skipped, error_details
+    processor = BatchProcessor(max_retries=1)
+    return processor.process_batch_safe(qdrant_client, confluence, pages, state, space_key)
 
 
 def get_blogposts_from_space(confluence: Confluence, space_key: str, start: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
@@ -1941,7 +1640,7 @@ def get_blogposts_from_space(confluence: Confluence, space_key: str, start: int 
         space_key: Ключ пространства
         start: Начальная позиция
         limit: Количество постов
-    
+
     Returns:
         Список blog posts
     """
@@ -1960,14 +1659,6 @@ def get_blogposts_from_space(confluence: Confluence, space_key: str, start: int 
 def cleanup_deleted_pages(qdrant_client: Any, state: Dict[str, Any], current_page_ids: set) -> int:
     """
     Удаление документов из индекса для страниц, которые были удалены в Confluence.
-
-    Args:
-        qdrant_client: Qdrant клиент
-        state: Текущее состояние синхронизации
-        current_page_ids: Набор ID страниц, которые существуют в Confluence
-    
-    Returns:
-        Количество удалённых страниц
     """
     # Используем функцию из postgres_storage для очистки PostgreSQL
     deleted_count = cleanup_deleted_pages_postgres(current_page_ids)
@@ -1979,7 +1670,7 @@ def cleanup_deleted_pages(qdrant_client: Any, state: Dict[str, Any], current_pag
     if not deleted_page_ids:
         logger.debug("Нет удалённых страниц для очистки")
         return deleted_count
-    
+
     logger.info(f"Обнаружено {len(deleted_page_ids)} удалённых страниц в Confluence")
 
     for page_id in deleted_page_ids:
@@ -1993,318 +1684,159 @@ def cleanup_deleted_pages(qdrant_client: Any, state: Dict[str, Any], current_pag
                 del state['pages'][page_id]
         except Exception as e:
             logger.error(f"Ошибка удаления страницы {page_id}: {e}")
-    
+
     return deleted_count
 
+def _init_services() -> Optional[tuple]:
+    """Инициализация сервисов (Confluence, Postgres, Qdrant)."""
+    try:
+        confluence = Confluence(url=CONFLUENCE_URL, token=CONFLUENCE_TOKEN)
+        logger.info("Connected to Confluence")
+
+        logger.info("Шаг 1: Инициализация PostgreSQL...")
+        init_postgres_schema()
+
+        logger.info("Шаг 2: Загрузка embedding модели...")
+        get_embed_model()
+
+        logger.info("Шаг 3: Инициализация Qdrant...")
+        from embeddings import get_embedding_dimension
+        model_dim = get_embedding_dimension()
+
+        qdrant_client = init_qdrant_client()
+        if not init_qdrant_collection(model_dim):
+            raise ValueError(f"Failed to init Qdrant collection {model_dim}D")
+
+        return confluence, qdrant_client
+    except Exception as e:
+        logger.error(f"Init error: {e}")
+        return None
+
+def _get_target_spaces(confluence: Confluence) -> List[Dict[str, Any]]:
+    """Получение целевых пространств."""
+    try:
+        all_spaces = confluence.get_all_spaces().get('results', [])
+        if CONFLUENCE_SPACES:
+            targets = [s.strip().upper() for s in CONFLUENCE_SPACES.split(',') if s.strip()]
+            spaces = [s for s in all_spaces if s.get('key', '').upper() in targets]
+            logger.info(f"Фильтр пространств: {len(spaces)} из {len(all_spaces)}")
+            return spaces
+        logger.info(f"Processing {len(all_spaces[:MAX_SPACES])} spaces")
+        return all_spaces[:MAX_SPACES]
+    except Exception as e:
+        logger.error(f"Error fetching spaces: {e}")
+        return []
+
+def _process_items_parallel(processor: BatchProcessor, items: list, qdrant_client: Any,
+                          confluence: Confluence, state: Dict, key: str, stats: Dict):
+    """Параллельная обработка списка элементов."""
+    if not items: return
+
+    batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
+    max_workers = get_int_env("PARALLEL_SYNC_MAX_WORKERS", 4)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(processor.process_batch_safe, qdrant_client, confluence, b, state, key): b
+            for b in batches
+        }
+        for f in as_completed(futures):
+            try:
+                u, e, s, d = f.result()
+                stats['updated'] += u
+                stats['errors'] += e
+                stats['skipped'] += s
+                stats['processed'] += len(futures[f])
+                stats['error_details'].extend(d)
+            except Exception as err:
+                logger.error(f"Batch failed: {err}")
+                stats['errors'] += 1
 
 def sync() -> None:
     """Основной процесс синхронизации Confluence с PostgreSQL + Qdrant."""
     logger.info("Sync started")
     state = load_state()
     start_time = time.time()
-    try:
-        # Примечание: параметр verify_ssl не поддерживается в текущей версии atlassian-python-api
-        confluence = Confluence(url=CONFLUENCE_URL, token=CONFLUENCE_TOKEN)
-        logger.info("Connected to Confluence")
-    except Exception as e:
-        logger.error(f"Confluence error: {e}")
-        return
-    try:
-        from embeddings import get_embedding_dimension
 
-        logger.info("Шаг 1: Инициализация PostgreSQL...")
-        init_postgres_schema()
-        logger.info("✅ PostgreSQL schema initialized")
+    # 1. Инициализация
+    services = _init_services()
+    if not services: return
+    confluence, qdrant_client = services
 
-        logger.info("Шаг 2: Загрузка embedding модели (может занять ~60 сек)...")
-        embed_model = get_embed_model()
-        logger.info(f"✅ Модель загружена: {type(embed_model)}")
+    # 2. Получение пространств
+    spaces = _get_target_spaces(confluence)
 
-        model_dim = get_embedding_dimension()
-
-        logger.info("Шаг 3: Инициализация Qdrant...")
-        qdrant_client = init_qdrant_client()
-        
-        # Инициализируем Qdrant коллекцию с проверкой размерности
-        if not init_qdrant_collection(model_dim):
-            raise ValueError(
-                f"Не удалось инициализировать Qdrant коллекцию. "
-                f"Проверьте размерность модели: {model_dim}D"
-            )
-        
-        logger.info(f"✅ Размерность embeddings: {model_dim}D")
-        logger.info("✅ Qdrant client ready")
-
-        # Проверяем количество документов
-        doc_count = get_qdrant_count()
-        logger.info(f"Текущее количество документов в Qdrant: {doc_count}")
-
-    except ValueError as ve:
-        # Это ошибка несовпадения размерности - не продолжаем
-        logger.error(f"Sync остановлен: {ve}")
-        return
-    except Exception as e:
-        logger.error(f"Init error: {e}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        return
-    total_updated, total_errors, total_skipped = 0, 0, 0
-    current_page_ids = set()  # Для отслеживания существующих страниц
-    
-    # Словарь для статистики по пространствам
     space_stats = {}
+    current_page_ids = set()
+    total_updated, total_errors, total_skipped = 0, 0, 0
 
-    try:
-        all_spaces = confluence.get_all_spaces().get('results', [])
+    batch_processor = BatchProcessor(max_retries=3)
 
-        # Фильтрация пространств
-        if CONFLUENCE_SPACES:
-            # Парсим список пространств из ENV (через запятую)
-            target_spaces = [s.strip().upper() for s in CONFLUENCE_SPACES.split(',') if s.strip()]
-            spaces = [s for s in all_spaces if s.get('key', '').upper() in target_spaces]
-            
-            # Предупреждение, если оба параметра указаны
-            if MAX_SPACES != 10:  # Если MAX_SPACES изменен от значения по умолчанию
-                logger.warning(f"⚠️  Указаны оба параметра: CONFLUENCE_SPACES и MAX_SPACES={MAX_SPACES}")
-                logger.warning("   Используется CONFLUENCE_SPACES (MAX_SPACES игнорируется)")
-            
-            logger.info(f"Фильтр пространств: {len(spaces)} из {len(all_spaces)} (указаны: {CONFLUENCE_SPACES})")
+    if TQDM_AVAILABLE:
+        spaces_iter = tqdm(spaces, desc="Syncing spaces", unit="space")
+    else:
+        spaces_iter = spaces
 
-            # Предупреждение, если некоторые указанные пространства не найдены
-            found_keys = {s.get('key', '').upper() for s in spaces}
-            not_found = [t for t in target_spaces if t not in found_keys]
-            if not_found:
-                logger.warning(f"⚠️  Пространства не найдены в Confluence: {', '.join(not_found)}")
-        else:
-            # Старое поведение: MAX_SPACES
-            spaces = all_spaces[:MAX_SPACES]
-            logger.info(f"Processing {len(spaces)} spaces (MAX_SPACES={MAX_SPACES})")
+    # 3. Обработка пространств
+    for space in spaces_iter:
+        key = space.get('key', '')
+        if not key: continue
 
-        # Используем tqdm если доступен
-        if TQDM_AVAILABLE:
-            spaces_iter = tqdm(spaces, desc="Syncing spaces", unit="space")
-        else:
-            spaces_iter = spaces
+        if TQDM_AVAILABLE: spaces_iter.set_description(f"Syncing {space.get('name', key)}")
 
-        for space in spaces_iter:
-            key = space.get('key', '')
-            if not key:
-                continue
-            
-            space_name = space.get('name', key)
+        logger.info(f"📂 {space.get('name', key)}:")
+        stats = {
+            'total_pages': 0, 'total_blogs': 0, 'processed': 0,
+            'updated': 0, 'skipped': 0, 'errors': 0, 'chunks_created': 0, 'error_details': []
+        }
+        space_stats[key] = stats
 
-            # Обновляем описание progress bar
-            if TQDM_AVAILABLE:
-                spaces_iter.set_description(f"Syncing {space_name}")
+        # Обработка страниц
+        pages = []
+        for page in get_all_pages_generator(confluence, key, batch_size=BATCH_SIZE):
+            pages.append(page)
+            if page.get('id'): current_page_ids.add(str(page['id']))
 
-            # Инициализация статистики для пространства
-            space_stats[key] = {
-                'total_pages': 0,
-                'total_blogs': 0,
-                'processed': 0,
-                'updated': 0,
-                'skipped': 0,
-                'errors': 0,
-                'chunks_created': 0,
-                'error_details': []
-            }
+        stats['total_pages'] = len(pages)
+        logger.info(f"   Страниц: {len(pages)}")
 
-            logger.info(f"📂 {space_name}:")
-            try:
-                # Используем генератор вместо загрузки всех страниц
-                all_pages = []
-                for page in get_all_pages_generator(confluence, key, batch_size=BATCH_SIZE):
-                    all_pages.append(page)
-                    page_id = str(page.get('id', ''))
-                    if page_id:
-                        current_page_ids.add(page_id)
+        _process_items_parallel(batch_processor, pages, qdrant_client, confluence, state, key, stats)
 
-                space_stats[key]['total_pages'] = len(all_pages)
-                logger.info(f"   Страниц найдено: {len(all_pages)} (блогов: 0)")
-                if not all_pages:
-                    logger.info("   Обработано: 0")
-                    logger.info("   Обновлено: 0 | Пропущено: 0 | Ошибок: 0")
-                    logger.info("   Chunks создано: 0")
-                    continue
-                
-                # Разбиваем на батчи
-                batches = [all_pages[i:i + BATCH_SIZE] for i in range(0, len(all_pages), BATCH_SIZE)]
+        # Обработка блогов
+        blogs = []
+        start = 0
+        while True:
+            b = get_blogposts_from_space(confluence, key, start=start, limit=BATCH_SIZE)
+            if not b: break
+            blogs.extend(b)
+            start += BATCH_SIZE
 
-                # Параллельный процессинг с ThreadPoolExecutor
-                max_workers = get_int_env("PARALLEL_SYNC_MAX_WORKERS", 4)
-                batch_processor = BatchProcessor(max_retries=3)
-                
-                if TQDM_AVAILABLE:
-                    batches_iter = tqdm(batches, desc=f"  Processing {space_name}", unit="batch", leave=False)
-                else:
-                    batches_iter = batches
+        for blog in blogs:
+            if blog.get('id'): current_page_ids.add(str(blog['id']))
 
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    # Отправляем все батчи на обработку
-                    future_to_batch = {
-                        executor.submit(
-                            batch_processor.process_batch_safe,
-                            qdrant_client, confluence, batch, state, key
-                        ): batch
-                        for batch in batches
-                    }
+        stats['total_blogs'] = len(blogs)
+        if blogs:
+            logger.info(f"   Блогов: {len(blogs)}")
+            _process_items_parallel(batch_processor, blogs, qdrant_client, confluence, state, key, stats)
 
-                    # Собираем результаты
-                    for future in as_completed(future_to_batch):
-                        batch = future_to_batch[future]
-                        try:
-                            batch_updated, batch_errors, batch_skipped, batch_error_details = future.result()
-                            total_updated += batch_updated
-                            total_errors += batch_errors
-                            total_skipped += batch_skipped
-                            space_stats[key]['updated'] += batch_updated
-                            space_stats[key]['errors'] += batch_errors
-                            space_stats[key]['skipped'] += batch_skipped
-                            space_stats[key]['processed'] += len(batch)
-                            space_stats[key]['error_details'].extend(batch_error_details)
-                            
-                            if TQDM_AVAILABLE:
-                                batches_iter.update(1)
-                                batches_iter.set_postfix({
-                                    "updated": space_stats[key]['updated'],
-                                    "errors": space_stats[key]['errors']
-                                })
-                        except Exception as e:
-                            logger.error(f"Batch processing failed: {e}")
-                            total_errors += 1
-                            space_stats[key]['errors'] += 1
-                            if TQDM_AVAILABLE:
-                                batches_iter.update(1)
+        # Агрегация статистики
+        total_updated += stats['updated']
+        total_errors += stats['errors']
+        total_skipped += stats['skipped']
 
-                # Логируем статистику пространства
-                logger.info(f"   Обработано: {space_stats[key]['processed']}")
-                logger.info(f"   Обновлено: {space_stats[key]['updated']} | Пропущено: {space_stats[key]['skipped']} | Ошибок: {space_stats[key]['errors']}")
-                
-                # Подсчет chunks (упрощенная версия)
-                chunks_count = 0
-                # Можно добавить более точный подсчет из Qdrant если нужно
-                space_stats[key]['chunks_created'] = chunks_count
-                logger.info(f"   Chunks создано: {chunks_count}")
+        logger.info(f"   Итог: Upd={stats['updated']} Skip={stats['skipped']} Err={stats['errors']}")
 
-                # Логируем статистику кэша
-                cache_stats = get_cache_stats()
-                logger.debug(f"   Cache stats: {cache_stats}")
-
-                # Обработка blog posts (аналогично, но без параллельности для простоты)
-                try:
-                    all_blogs = []
-                    blog_start = 0
-                    while True:
-                        batch_blogs = get_blogposts_from_space(confluence, key, start=blog_start, limit=BATCH_SIZE)
-                        if not batch_blogs:
-                            break
-                        all_blogs.extend(batch_blogs)
-                        blog_start += BATCH_SIZE
-                    
-                    for blog in all_blogs:
-                        blog_id = str(blog.get('id', ''))
-                        if blog_id:
-                            current_page_ids.add(blog_id)
-
-                    space_stats[key]['total_blogs'] = len(all_blogs)
-                    if all_blogs:
-                        logger.info(f"   Блогов найдено: {len(all_blogs)}")
-                        # Обработка блогов (можно добавить параллельность позже)
-                        for i in range(0, len(all_blogs), BATCH_SIZE):
-                            batch = all_blogs[i:i + BATCH_SIZE]
-                            updated, errors, skipped, error_details = batch_processor.process_batch_safe(
-                                qdrant_client, confluence, batch, state, key
-                            )
-                            total_updated += updated
-                            total_errors += errors
-                            total_skipped += skipped
-                            space_stats[key]['updated'] += updated
-                            space_stats[key]['errors'] += errors
-                            space_stats[key]['skipped'] += skipped
-                            space_stats[key]['processed'] += len(batch)
-                            space_stats[key]['error_details'].extend(error_details)
-                except Exception as blog_err:
-                    logger.warning(f"Error processing blogs for {key}: {blog_err}")
-                    space_stats[key]['error_details'].append(f"Blog processing error: {str(blog_err)}")
-
-            except Exception as e:
-                logger.error(f"Space error for {key}: {e}")
-                total_errors += 1
-                space_stats[key]['errors'] += 1
-                space_stats[key]['error_details'].append(f"Space processing error: {str(e)}")
-
-            # Обновляем postfix для progress bar
-            if TQDM_AVAILABLE:
-                spaces_iter.set_postfix({
-                    "updated": total_updated,
-                    "errors": total_errors
-                })
-    except Exception as e:
-        logger.error(f"Critical: {e}")
-        return
-
-    # Подсчет chunks для каждого пространства
-    try:
-        from qdrant_storage import get_points_by_filter
-        for space_key in space_stats.keys():
-            space_data = get_points_by_filter(filter_dict={"space": space_key}, limit=10000)
-            space_stats[space_key]['chunks_created'] = len(space_data.get('ids', []))
-    except Exception as e:
-        logger.warning(f"Не удалось подсчитать chunks по пространствам: {e}")
-
-    # Очистка удалённых страниц
+    # 4. Очистка и сохранение
     deleted_count = cleanup_deleted_pages(qdrant_client, state, current_page_ids)
-
-    # TODO: Реализовать извлечение доменных терминов из Qdrant
-    # (ранее было для ChromaDB, требует адаптации для Qdrant)
-
     state['last_sync'] = int(time.time())
     save_state(state)
+
     elapsed = time.time() - start_time
-    
-    # ============ ДЕТАЛЬНАЯ СТАТИСТИКА ПО ПРОСТРАНСТВАМ ============
-    logger.info("")
+
+    # Итоговый отчет
     logger.info("=" * 80)
-    logger.info("📊 ИТОГИ СИНХРОНИЗАЦИИ")
-    logger.info("=" * 80)
-    logger.info(f"⏱  Время выполнения: {elapsed:.1f}с ({elapsed / 60:.1f} мин)")
-    logger.info("")
-    logger.info("📁 СТАТИСТИКА ПО ПРОСТРАНСТВАМ:")
-    logger.info("-" * 80)
-
-    for space_key, stats in sorted(space_stats.items()):
-        logger.info(f"  📂 {space_key}:")
-        logger.info(f"     Страниц найдено: {stats['total_pages']} (блогов: {stats['total_blogs']})")
-        logger.info(f"     Обработано: {stats['processed']}")
-        logger.info(f"     Обновлено: {stats['updated']} | Пропущено: {stats['skipped']} | Ошибок: {stats['errors']}")
-        logger.info(f"     Chunks создано: {stats['chunks_created']}")
-        if stats['error_details']:
-            logger.warning(f"     ⚠️  Ошибки ({len(stats['error_details'])}):")
-            for err in stats['error_details'][:5]:  # Показываем первые 5 ошибок
-                logger.warning(f"        - {err}")
-            if len(stats['error_details']) > 5:
-                logger.warning(f"        ... и еще {len(stats['error_details']) - 5} ошибок")
-        logger.info("")
-
-    logger.info("=" * 80)
-    logger.info("📈 ОБЩАЯ СТАТИСТИКА:")
-    logger.info(f"   ✅ Обновлено: {total_updated}")
-    logger.info(f"   ⏭  Пропущено: {total_skipped}")
-    logger.info(f"   ❌ Ошибок: {total_errors}")
-    logger.info(f"   🗑  Удалено: {deleted_count}")
-    logger.info(f"   ⏱  Время: {elapsed:.1f}с")
-
-    # Статистика PostgreSQL и Qdrant
-    try:
-        pg_stats = get_postgres_stats()
-        qdrant_count = get_qdrant_count()
-        logger.info("")
-        logger.info("📊 СТАТИСТИКА ХРАНИЛИЩ:")
-        logger.info(f"   PostgreSQL: {pg_stats['total_pages']} страниц ({pg_stats['not_indexed']} не проиндексировано)")
-        logger.info(f"   Qdrant: {qdrant_count} документов")
-    except Exception as e:
-        logger.warning(f"Не удалось получить статистику хранилищ: {e}")
-
+    logger.info(f"🏁 Sync finished in {elapsed:.1f}s")
+    logger.info(f"✅ Updated: {total_updated} | ⏭ Skipped: {total_skipped} | ❌ Errors: {total_errors} | 🗑 Deleted: {deleted_count}")
     logger.info("=" * 80)
 
 

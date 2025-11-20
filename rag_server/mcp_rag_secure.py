@@ -42,6 +42,7 @@ from synonyms_manager import get_synonyms_manager
 from advanced_search import extract_keywords
 from query_rewriter import cached_rewrite_query, get_rewriter_stats
 from observability import setup_observability
+from hybrid_search import init_bm25_retriever
 
 # Глобальная переменная для reranker (ленивая инициализация)
 reranker = None
@@ -112,134 +113,126 @@ def init_reranker():
         logger.debug("Переиспользование кэшированного CrossEncoder")
     return reranker
 
-def expand_query(query: str, space: str = "") -> list[str]:  # noqa: C901
-    """
-    Умное расширение запроса с использованием множественных источников синонимов.
-
-    Источники синонимов (в порядке приоритета):
-    1. НОВОЕ: Semantic Query Log (успешные запросы пользователей) <- ВЫСШИЙ ПРИОРИТЕТ!
-    2. Базовый словарь (50 общих IT-терминов)
-    3. Доменные термины (автоматически из Confluence)
-    4. Выученные синонимы (Query Mining)
-    5. Ollama (опционально, если включен)
-
-    ОПТИМИЗАЦИЯ: Адаптивное количество вариантов в зависимости от длины запроса.
-
-    Args:
-        query: Исходный запрос
-        space: Пространство для контекста (опционально)
-
-    Returns:
-        Список запросов (оригинал + варианты)
-    """
-    queries = [query]
-    query_lower = query.lower().strip()
-
-    # ОПТИМИЗАЦИЯ: Определяем максимальное количество вариантов по длине запроса
+def _get_max_variants(query: str) -> int:
+    """Определяет максимальное количество вариантов расширения."""
     query_length = len(query.split())
     if query_length <= 2:
-        max_variants = 5  # Короткий запрос -> больше вариантов для покрытия
+        return 5
     elif query_length <= 4:
-        max_variants = 3  # Средний запрос -> умеренное расширение
-    else:
-        max_variants = 2  # Длинный запрос -> минимальное расширение (уже специфичен)
+        return 3
+    return 2
 
-    # === ИСТОЧНИК 1 (ВЫСШИЙ ПРИОРИТЕТ): Semantic Query Log (успешные запросы пользователей) ===
-    semantic_log = None  # Инициализируем для использования в Query Rewriting
+def _expand_with_semantic_log(query: str, current_queries: list, max_variants: int):
+    """Источник 1: Semantic Query Log."""
+    if len(current_queries) >= max_variants:
+        return
+
     try:
         from semantic_query_log import get_semantic_query_log
-
         semantic_log = get_semantic_query_log()
         related_queries = semantic_log.get_related_queries(query, top_n=3)
 
-        for related_query in related_queries:
-            if related_query not in queries:
-                queries.append(related_query)
-                logger.debug(f"Semantic Query Log: добавлен похожий запрос '{related_query}'")
-
-                if len(queries) >= max_variants:
+        for related in related_queries:
+            if related not in current_queries:
+                current_queries.append(related)
+                logger.debug(f"Semantic Query Log: добавлен похожий запрос '{related}'")
+                if len(current_queries) >= max_variants:
                     break
-
-        if related_queries:
-            logger.debug(f"Semantic Query Log: найдено {len(related_queries)} похожих запросов")
     except Exception as e:
         logger.debug(f"Semantic Query Log недоступен: {e}")
 
-    # === ИСТОЧНИК 2-4: SynonymsManager (базовый + доменные + выученные) ===
+def _expand_with_synonyms(query: str, current_queries: list, max_variants: int):
+    """Источник 2-4: SynonymsManager."""
+    if len(current_queries) >= max_variants:
+        return
+
     try:
         synonyms_manager = get_synonyms_manager()
         from synonyms_manager import TERM_BLACKLIST
 
-        # Извлекаем ключевые слова из запроса
         keywords = extract_keywords(query)
+        query_lower = query.lower().strip()
 
-        # Для каждого ключевого слова получаем синонимы
-        for keyword in keywords[:3]:  # Максимум 3 ключевых слова
+        for keyword in keywords[:3]:
+            if len(current_queries) >= max_variants:
+                break
+
             keyword_lower = keyword.lower()
-
-
-            # ЗАЩИТА: Не заменяем blacklist термины (собственные имена, названия инструментов)
             if keyword_lower in TERM_BLACKLIST:
-                logger.debug(f"Пропускаю blacklist термин: {keyword}")
                 continue
 
             synonyms = synonyms_manager.get_synonyms(keyword, max_synonyms=2)
+            if not synonyms:
+                continue
 
-            if synonyms:
-                # Заменяем ключевое слово на синоним с использованием word boundaries
-                for synonym in synonyms:
-                    # Используем regex для точного совпадения слова (re уже импортирован в начале файла)
-                    pattern = r'\b' + re.escape(keyword_lower) + r'\b'
-                    expanded = re.sub(pattern, synonym.lower(), query_lower, flags=re.IGNORECASE)
+            for synonym in synonyms:
+                pattern = r'\b' + re.escape(keyword_lower) + r'\b'
+                expanded = re.sub(pattern, synonym.lower(), query_lower, flags=re.IGNORECASE)
 
-                    if expanded != query_lower and expanded not in queries:
-                        queries.append(expanded)
-
-                        if len(queries) >= max_variants:
-                            break
-
-            if len(queries) >= max_variants:
-                break
-
-
+                if expanded != query_lower and expanded not in current_queries:
+                    current_queries.append(expanded)
+                    if len(current_queries) >= max_variants:
+                        break
     except Exception as e:
         logger.warning(f"Ошибка при расширении запроса через SynonymsManager: {e}")
 
-    # === ИСТОЧНИК 5: Query Rewriting (Ollama -> OpenRouter) ===
-    try:
-        rewrite_variants = cached_rewrite_query(query, semantic_log=semantic_log)
-        for variant in rewrite_variants[1:]:  # Пропускаем первый (оригинал)
-            if variant not in queries and len(queries) < max_variants:
-                queries.append(variant)
-                logger.debug(f"Query rewriting variant: {variant}")
+def _expand_with_rewriting(query: str, current_queries: list, max_variants: int):
+    """Источник 5: Query Rewriting."""
+    if len(current_queries) >= max_variants:
+        return
 
-                if len(queries) >= max_variants:
+    try:
+        # Передаем None для semantic_log, так как он используется внутри cached_rewrite_query опционально
+        rewrite_variants = cached_rewrite_query(query, semantic_log=None)
+        for variant in rewrite_variants[1:]:
+            if variant not in current_queries:
+                current_queries.append(variant)
+                logger.debug(f"Query rewriting variant: {variant}")
+                if len(current_queries) >= max_variants:
                     break
     except Exception as e:
         logger.warning(f"Query rewriting failed: {e}")
 
-    # Добавляем запрос без стоп-слов
+def expand_query(query: str, space: str = "") -> list[str]:
+    """
+    Умное расширение запроса с использованием множественных источников синонимов.
+    """
+    queries = [query]
+    max_variants = _get_max_variants(query)
+
+    # Источник 1: Semantic Query Log
+    _expand_with_semantic_log(query, queries, max_variants)
+
+    # Источник 2-4: SynonymsManager
+    _expand_with_synonyms(query, queries, max_variants)
+
+    # Источник 5: Query Rewriting
+    _expand_with_rewriting(query, queries, max_variants)
+
+    # Дополнительная обработка (стоп-слова, space, 1С)
     keywords = extract_keywords(query)
     if len(keywords) >= 2:
         clean_query = ' '.join(keywords)
         if clean_query not in queries:
             queries.append(clean_query)
 
-    # Добавляем контекст пространства
-    if space and len(query_lower.split()) <= 5:  # Только для коротких запросов
+    query_lower = query.lower()
+    if space and len(query_lower.split()) <= 5:
         queries.append(f"{query} {space}")
 
-    # Специфичные для 1С/технологий термины
     if any(term in query_lower for term in ['1с', '1c', 'конфигурация']):
         normalized = query.replace('1С', '1C').replace('1с', '1c')
         if normalized != query and normalized not in queries:
             queries.append(normalized)
 
-    # ОПТИМИЗАЦИЯ: Применяем адаптивный лимит
+    # Итоговая дедупликация и обрезка
     result = list(dict.fromkeys(queries))[:max_variants]
 
     if len(result) < len(queries):
-        logger.debug(f"Query expansion ограничен: {len(queries)} → {len(result)} вариантов (query_length={query_length})")
+        logger.debug(
+            f"Query expansion ограничен: {len(queries)} -> {len(result)} "
+            f"вариантов (len={len(query.split())})"
+        )
 
     return result
 
@@ -695,7 +688,43 @@ def get_all_metadata_cached(ttl_seconds: int = 3600) -> Dict[str, Any]:
         logger.warning(f"Ошибка обновления metadata cache: {e}")
         return _metadata_cache if _metadata_cache else {}
 
-def parse_query_structure(query: str) -> Dict[str, Any]:  # noqa: C901
+STRUCTURAL_SEPARATORS = ['>', '→', '→', ' / ', ' | ']
+STRUCTURAL_PATTERNS = [
+    (r'по\s+блоку\s+(\w+)(?:\s*,\s*а\s+точнее\s+)?([^\.]+)?', True),
+    (r'(\w+)\s*,\s*а\s+точнее\s+([^\.]+)', True),
+    (r'по\s+блоку\s+(\w+)', False),
+    (r'в\s+разделе\s+(\w+)', False),
+    (r'на\s+странице\s+(\w+)', False),
+]
+
+def _parse_with_separators(query: str) -> list[str]:
+    """Парсинг по разделителям."""
+    for sep in STRUCTURAL_SEPARATORS:
+        if sep in query:
+            return [p.strip() for p in query.split(sep) if p.strip()]
+    return []
+
+def _parse_with_regex(query_lower: str) -> list[str]:
+    """Парсинг по регулярным выражениям."""
+    for pattern, extract_multi in STRUCTURAL_PATTERNS:
+        match = re.search(pattern, query_lower)
+        if match:
+            groups = [g.strip() for g in match.groups() if g and g.strip()]
+
+            if extract_multi:
+                 if len(groups) >= 2:
+                     return groups
+                 elif len(groups) == 1:
+                     # Дополнительная проверка на "а точнее" если в основной регулярке не поймали
+                     after_match = re.search(r'а\s+точнее\s+([^\.]+)', query_lower)
+                     if after_match:
+                         return [groups[0], after_match.group(1).strip()]
+                     return groups
+            else:
+                 return groups
+    return []
+
+def parse_query_structure(query: str) -> Dict[str, Any]:
     """
     Парсит структурные компоненты запроса.
 
@@ -715,58 +744,16 @@ def parse_query_structure(query: str) -> Dict[str, Any]:  # noqa: C901
     """
     query_lower = query.lower().strip()
 
-    # Проверяем наличие разделителей иерархии
-    structural_separators = ['>', '→', '→', ' / ', ' | ']
-    has_separator = any(sep in query for sep in structural_separators)
+    # 1. Проверка разделителей
+    parts = _parse_with_separators(query)
+    is_structural = bool(parts)
 
-    # Проверяем паттерны структурных запросов
-    # УЛУЧШЕНО: Добавлены паттерны для "по блоку X, а точнее Y"
-    structural_patterns = [
-        (r'по\s+блоку\s+(\w+)(?:\s*,\s*а\s+точнее\s+)?([^\.]+)?', True),  # "по блоку Склад, а точнее Учет номенклатуры"
-        (r'(\w+)\s*,\s*а\s+точнее\s+([^\.]+)', True),  # "Склад, а точнее Учет номенклатуры"
-        (r'по\s+блоку\s+(\w+)', False),  # "по блоку Склад"
-        (r'в\s+разделе\s+(\w+)', False),  # "в разделе Учет"
-        (r'на\s+странице\s+(\w+)', False),  # "на странице Склад"
-    ]
-
-    is_structural = has_separator
-    parts = []
-
-    if has_separator:
-        # Разделяем по разделителям
-        for sep in structural_separators:
-            if sep in query:
-                parts = [p.strip() for p in query.split(sep) if p.strip()]
-                break
-    else:
-        # Проверяем паттерны (включая новые для "а точнее")
-        for pattern, extract_parts in structural_patterns:
-            match = re.search(pattern, query_lower)
-            if match:
-                is_structural = True
-                if extract_parts:
-                    # Извлекаем все группы из паттерна
-                    groups = match.groups()
-                    extracted_parts = [g.strip() for g in groups if g and g.strip()]
-                    if len(extracted_parts) >= 2:
-                        # Нашли паттерн "X, а точнее Y" - используем обе части
-                        parts = extracted_parts
-                    elif len(extracted_parts) == 1:
-                        # Нашли первую часть, ищем вторую после "а точнее"
-                        after_match = re.search(r'а\s+точнее\s+([^\.]+)', query_lower)
-                        if after_match:
-                            parts = [extracted_parts[0], after_match.group(1).strip()]
-                        else:
-                            parts = extracted_parts
-                    break
-                else:
-                    # Старый паттерн - извлекаем найденную часть
-                    groups = match.groups()
-                    if groups:
-                        parts = [g.strip() for g in groups if g and g.strip()]
-                    else:
-                        parts = [query]
-                    break
+    # 2. Проверка регулярок если не нашли разделители
+    if not is_structural:
+        regex_parts = _parse_with_regex(query_lower)
+        if regex_parts:
+            parts = regex_parts
+            is_structural = True
 
     result = {
         'is_structural_query': is_structural,
@@ -780,11 +767,51 @@ def parse_query_structure(query: str) -> Dict[str, Any]:  # noqa: C901
     return result
 
 
+def _calculate_structural_match(parts: list, metadata: dict) -> tuple[float, list]:
+    """Вычисляет скор совпадения структуры для одного документа."""
+    # Конфигурация полей и их весов
+    FIELD_WEIGHTS = [
+        ('page_path', 3.0),
+        ('title', 2.0),
+        ('heading_path', 1.5),
+        ('heading', 1.0),
+    ]
+
+    match_score = 0.0
+    matches = []
+
+    # Предварительная нормализация
+    fields = {
+        field: (metadata.get(field, '') or '').lower()
+        for field, _ in FIELD_WEIGHTS
+    }
+
+    for part_idx, part in enumerate(parts):
+        part_lower = part.lower()
+        position_weight = len(parts) - part_idx
+        matched = False
+
+        for field_name, base_weight in FIELD_WEIGHTS:
+            if part_lower in fields[field_name]:
+                match_score += base_weight + position_weight
+                matches.append({
+                    'part': part,
+                    'field': field_name,
+                    'weight': position_weight
+                })
+                matched = True
+                break
+
+        if not matched:
+            return 0.0, []  # Требуем совпадения всех частей
+
+    return match_score, matches
+
 def structural_metadata_search(
     collection: Any,
     structure: Dict[str, Any],
     limit: int = 10
-) -> List[Dict[str, Any]]:  # noqa: C901
+) -> List[Dict[str, Any]]:
     """
     Поиск по метаданным на основе структуры запроса.
 
@@ -851,63 +878,9 @@ def structural_metadata_search(
             if not metadata:
                 continue
 
-            doc_id = all_data['ids'][idx] if idx < len(all_data['ids']) else ''
+            match_score, matches = _calculate_structural_match(parts, metadata)
 
-            # Данные документа
-            page_path = (metadata.get('page_path', '') or '').lower()
-            title = (metadata.get('title', '') or '').lower()
-            heading_path = (metadata.get('heading_path', '') or '').lower()
-            heading = (metadata.get('heading', '') or '').lower()
-
-            # Проверяем совпадение всех частей запроса
-            # Стратегия: каждая часть запроса должна встречаться хотя бы в одном поле
-            all_parts_matched = True
-            match_score = 0
-            matches = []
-
-            for part_idx, part in enumerate(parts):
-                part_lower = part.lower()
-                part_matched = False
-                matched_field = ""
-
-                # 1. Проверка в пути страницы (самый сильный сигнал)
-                if part_lower in page_path:
-                    part_matched = True
-                    match_score += 3.0
-                    matched_field = "page_path"
-
-                # 2. Проверка в заголовке
-                elif part_lower in title:
-                    part_matched = True
-                    match_score += 2.0
-                    matched_field = "title"
-
-                # 3. Проверка в пути заголовков
-                elif part_lower in heading_path:
-                    part_matched = True
-                    match_score += 1.5
-                    matched_field = "heading_path"
-
-                # 4. Проверка в заголовке раздела
-                elif part_lower in heading:
-                    part_matched = True
-                    match_score += 1.0
-                    matched_field = "heading"
-
-                if not part_matched:
-                    all_parts_matched = False
-                    break
-                else:
-                    # Бонус за порядок (первые части важнее)
-                    weight = len(parts) - part_idx
-                    match_score += weight
-                    matches.append({
-                        'part': part,
-                        'field': matched_field,
-                        'weight': weight
-                    })
-
-            if all_parts_matched:
+            if match_score > 0:
                 matched_count += 1
                 formatted_results.append({
                     'metadata': metadata,
@@ -997,9 +970,21 @@ def cached_structural_search(
 
     return results
 
+def _find_best_keyword_match(text: str, keywords: list) -> tuple[str, float]:
+    """Найти лучшее совпадение ключевого слова в тексте."""
+    if not text:
+        return "", 0.0
+
+    text_lower = text.lower()
+    for keyword in keywords:
+        if len(keyword) > 3 and keyword in text_lower:
+            score = len(keyword) / len(text_lower)
+            return keyword, score
+    return "", 0.0
+
 def analyze_query_with_metadata(
     query: str
-) -> Dict[str, Any]:  # noqa: C901
+) -> Dict[str, Any]:
     """
     Анализирует запрос и находит совпадения в метаданных.
 
@@ -1011,7 +996,6 @@ def analyze_query_with_metadata(
     Returns:
         Словарь с совпадениями в метаданных
     """
-    query_lower = query.lower()
     keywords = extract_keywords(query)
 
     # Получаем кэшированные метаданные
@@ -1020,10 +1004,11 @@ def analyze_query_with_metadata(
     if not all_data or not all_data.get('metadatas'):
         return {'page_title_matches': [], 'heading_path_matches': [], 'page_path_matches': []}
 
-    page_title_matches = []
-    heading_path_matches = []
-    page_path_matches = []
-
+    matches = {
+        'page_title_matches': [],
+        'heading_path_matches': [],
+        'page_path_matches': []
+    }
     seen_pages = set()
 
     for idx, metadata in enumerate(all_data['metadatas']):
@@ -1031,60 +1016,51 @@ def analyze_query_with_metadata(
             continue
 
         page_id = metadata.get('page_id')
-        if not page_id or page_id in seen_pages:
+        if not page_id:
             continue
 
-        # Проверяем совпадения в page_title
-        page_title = (metadata.get('title', '') or '').lower()
-        if page_title:
-            for keyword in keywords:
-                if len(keyword) > 3 and keyword in page_title:
-                    page_title_matches.append({
-                        'page_id': page_id,
-                        'page_title': metadata.get('title', ''),
-                        'page_path': metadata.get('page_path', ''),
-                        'match_keyword': keyword,
-                        'match_score': len(keyword) / len(page_title) if page_title else 0
-                    })
-                    seen_pages.add(page_id)
-                    break
+        # Проверка title (только уникальные страницы)
+        if page_id not in seen_pages:
+            title = metadata.get('title', '')
+            kw, score = _find_best_keyword_match(title, keywords)
+            if score > 0:
+                matches['page_title_matches'].append({
+                    'page_id': page_id,
+                    'page_title': title,
+                    'page_path': metadata.get('page_path', ''),
+                    'match_keyword': kw,
+                    'match_score': score
+                })
+                seen_pages.add(page_id)
 
-        # Проверяем совпадения в page_path
-        page_path = (metadata.get('page_path', '') or '').lower()
-        if page_path:
-            for keyword in keywords:
-                if len(keyword) > 3 and keyword in page_path:
-                    page_path_matches.append({
-                        'page_id': page_id,
-                        'page_path': metadata.get('page_path', ''),
-                        'match_keyword': keyword,
-                        'match_score': len(keyword) / len(page_path) if page_path else 0
-                    })
-                    break
+        # Проверка page_path
+        page_path = metadata.get('page_path', '')
+        kw, score = _find_best_keyword_match(page_path, keywords)
+        if score > 0:
+            matches['page_path_matches'].append({
+                'page_id': page_id,
+                'page_path': page_path,
+                'match_keyword': kw,
+                'match_score': score
+            })
 
-        # Проверяем совпадения в heading_path
-        heading_path = (metadata.get('heading_path', '') or '').lower()
-        if heading_path:
-            for keyword in keywords:
-                if len(keyword) > 3 and keyword in heading_path:
-                    heading_path_matches.append({
-                        'page_id': page_id,
-                        'heading_path': metadata.get('heading_path', ''),
-                        'match_keyword': keyword,
-                        'match_score': len(keyword) / len(heading_path) if heading_path else 0
-                    })
-                    break
+        # Проверка heading_path
+        heading_path = metadata.get('heading_path', '')
+        kw, score = _find_best_keyword_match(heading_path, keywords)
+        if score > 0:
+            matches['heading_path_matches'].append({
+                'page_id': page_id,
+                'heading_path': heading_path,
+                'match_keyword': kw,
+                'match_score': score
+            })
 
-    # Сортируем по match_score
-    page_title_matches.sort(key=lambda x: x['match_score'], reverse=True)
-    heading_path_matches.sort(key=lambda x: x['match_score'], reverse=True)
-    page_path_matches.sort(key=lambda x: x['match_score'], reverse=True)
+    # Сортируем по match_score и обрезаем
+    for key in matches:
+        matches[key].sort(key=lambda x: x['match_score'], reverse=True)
+        matches[key] = matches[key][:10]
 
-    return {
-        'page_title_matches': page_title_matches[:10],
-        'heading_path_matches': heading_path_matches[:10],
-        'page_path_matches': page_path_matches[:10]
-    }
+    return matches
 
 def apply_metadata_boost(
     results: List[Dict[str, Any]],
@@ -1166,6 +1142,22 @@ def get_diversity_limit_for_intent(intent_type: str = None) -> int:
 
     return diversity_limits.get(intent_type, 2)
 
+def _resolve_diversity_limit(max_per_page, query, intent) -> int:
+    """Определяет лимит документов с одной страницы на основе интента."""
+    if max_per_page is not None:
+        return max_per_page
+
+    intent_type = None
+    if intent and isinstance(intent, dict):
+        intent_type = intent.get('type')
+    elif query:
+        intent_dict = classify_query_intent(query)
+        intent_type = intent_dict.get('type') if intent_dict else None
+
+    limit = get_diversity_limit_for_intent(intent_type)
+    logger.debug(f"Diversity filter: автоматический лимит {limit} для intent={intent_type}")
+    return limit
+
 def apply_diversity_filter(results: list, limit: int = 5, max_per_page: int = None, query: str = None, intent: dict = None) -> list:
     """
     Применяет diversity filter: ограничивает количество chunks с одной страницы.
@@ -1188,18 +1180,7 @@ def apply_diversity_filter(results: list, limit: int = 5, max_per_page: int = No
     if not results:
         return []
 
-    # Определяем max_per_page на основе intent если не указан
-    if max_per_page is None:
-        intent_type = None
-        if intent and isinstance(intent, dict):
-            intent_type = intent.get('type')
-        elif query:
-            # Определяем intent из запроса если не передан
-            intent_dict = classify_query_intent(query)
-            intent_type = intent_dict.get('type') if intent_dict else None
-
-        max_per_page = get_diversity_limit_for_intent(intent_type)
-        logger.debug(f"Diversity filter: автоматический лимит {max_per_page} для intent={intent_type}")
+    limit_per_page = _resolve_diversity_limit(max_per_page, query, intent)
 
     filtered_results = []
     page_counts = {}
@@ -1215,7 +1196,7 @@ def apply_diversity_filter(results: list, limit: int = 5, max_per_page: int = No
         page_id = metadata.get('page_id')
 
         # Если страницы нет или лимит не превышен - добавляем
-        if not page_id or page_counts.get(page_id, 0) < max_per_page:
+        if not page_id or page_counts.get(page_id, 0) < limit_per_page:
             filtered_results.append(result)
             if page_id:
                 page_counts[page_id] = page_counts.get(page_id, 0) + 1
@@ -1226,7 +1207,7 @@ def apply_diversity_filter(results: list, limit: int = 5, max_per_page: int = No
 
     # Логирование для анализа
     if page_counts:
-        logger.debug(f"Diversity filter: {len(filtered_results)} results from {len(page_counts)} unique pages (max {max_per_page}/page)")
+        logger.debug(f"Diversity filter: {len(filtered_results)} results from {len(page_counts)} unique pages (max {limit_per_page}/page)")
         for page_id, count in page_counts.items():
             if count > 1:
                 logger.debug(f"  Page {page_id}: {count} chunks")
@@ -1394,8 +1375,46 @@ logger.info("✅ SearchPipeline initialized")
 
 mcp = FastMCP("Confluence RAG")
 
+def _extract_space_from_query(query: str, current_space: str) -> tuple[str, str]:
+    """Извлечь название space из текста запроса."""
+    if current_space:
+        return query, current_space
+
+    space_patterns = [
+        r'\bspaces?\s+([A-Za-z0-9_-]+)\s*$',
+        r'\bspaces?\s+([A-Za-z0-9_-]+)(?:\s|$)',
+        r'\bв\s+пространстве\s+([A-Za-z0-9_-]+)\s*$',
+        r'\bпространство\s+([A-Za-z0-9_-]+)\s*$',
+    ]
+
+    for pattern in space_patterns:
+        match = re.search(pattern, query, re.IGNORECASE)
+        if match:
+            space = match.group(1).strip()
+            new_query = re.sub(pattern, '', query, flags=re.IGNORECASE).strip()
+            logger.info(f"Извлечен space из запроса: '{space}'")
+            return new_query, space
+
+    return query, ""
+
+def _validate_search_params(query: str, space: str, limit: int) -> tuple[bool, str]:
+    """Валидация параметров поиска."""
+    if not query or not isinstance(query, str):
+        return False, "❌ Ошибка: Пустой или некорректный запрос"
+
+    if len(query.strip()) < 2:
+        return False, "❌ Ошибка: Запрос слишком короткий (минимум 2 символа)"
+
+    if space and not re.match(r'^[a-zA-Z0-9_-]+$', space.strip()):
+        return False, "❌ Ошибка: Параметр space содержит недопустимые символы"
+
+    if qdrant_client is None:
+        return False, "❌ Ошибка: RAG система не инициализирована. Проверьте логи сервера."
+
+    return True, ""
+
 @mcp.tool()
-def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> str:  # noqa: C901
+def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> str:
     """
     Выполняет семантический поиск по базе знаний Confluence.
 
@@ -1408,56 +1427,31 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
         Форматированный текст с результатами поиска
     """
     try:
-        # ============ БЕЗОПАСНОСТЬ: Валидация входных данных ============
-        if not query or not isinstance(query, str):
-            return "❌ Ошибка: Пустой или некорректный запрос"
-
+        # 1. Извлечение space
+        query, space = _extract_space_from_query(query, space)
         query = query.strip()
-        if len(query) < 2:
-            return "❌ Ошибка: Запрос слишком короткий (минимум 2 символа)"
+
+        # 2. Валидация
+        is_valid, error_msg = _validate_search_params(query, space, limit)
+        if not is_valid:
+            return error_msg
 
         if len(query) > 1000:
             logger.warning(f"Очень длинный запрос ({len(query)} символов), обрезаю до 1000")
             query = query[:1000]
 
-        # ============ НОВОЕ: Извлечение space из текста запроса ============
-        if not space:
-            space_patterns = [
-                r'\bspaces?\s+([A-Za-z0-9_-]+)\s*$',
-                r'\bspaces?\s+([A-Za-z0-9_-]+)(?:\s|$)',
-                r'\bв\s+пространстве\s+([A-Za-z0-9_-]+)\s*$',
-                r'\bпространство\s+([A-Za-z0-9_-]+)\s*$',
-            ]
-            for pattern in space_patterns:
-                match = re.search(pattern, query, re.IGNORECASE)
-                if match:
-                    space = match.group(1).strip()
-                    query = re.sub(pattern, '', query, flags=re.IGNORECASE).strip()
-                    logger.info(f"Извлечен space из запроса: '{space}'")
-                    break
-
-        # Проверка space
+        limit = min(max(limit, 1), 20)
         if space:
             space = space.strip()
-            if not re.match(r'^[a-zA-Z0-9_-]+$', space):
-                return "❌ Ошибка: Параметр space содержит недопустимые символы"
 
-        if qdrant_client is None:
-            return "❌ Ошибка: RAG система не инициализирована. Проверьте логи сервера."
-
-        limit = min(max(limit, 1), 20)
-
-        # ============ НОВОЕ: Structural Navigation Search ============
+        # 3. Structural Navigation Search
         structure = parse_query_structure(query)
         if structure['is_structural_query']:
             logger.info(f"🔍 Структурный запрос обнаружен: {structure['parts']}")
             structural_results = cached_structural_search(
-                QDRANT_COLLECTION,
-                structure,
-                limit=limit * 10
+                QDRANT_COLLECTION, structure, limit=limit * 10
             )
             if structural_results and len(structural_results) >= limit:
-                # Если нашли достаточно структурных результатов - возвращаем их
                 # Применяем легкий reranking
                 for result in structural_results:
                     max_match = max([r['match_score'] for r in structural_results]) if structural_results else 1
@@ -1467,14 +1461,10 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
                 metadata_analysis = analyze_query_with_metadata(query)
                 structural_results = apply_metadata_boost(structural_results, metadata_analysis)
                 structural_results.sort(key=lambda x: x.get('boosted_score', x.get('rerank_score', 0)), reverse=True)
-
                 return format_search_results(structural_results[:limit], query, limit)
 
-        # ============ Search Pipeline Execution ============
-        # 1. Query Expansion
+        # 4. Standard Semantic Search Pipeline
         expanded_queries = expand_query(query, space)
-
-        # 2. Execute Pipeline
         params = SearchParams(
             query=query,
             space=space if space else None,
@@ -1485,9 +1475,7 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
 
         results = search_pipeline.execute(params)
 
-        # 3. Format Results
         if not results:
-            # Fallback logic could go here if pipeline returns empty
             return f"❌ Ничего не найдено по запросу: '{query}'"
 
         return format_search_results(results, query, limit)

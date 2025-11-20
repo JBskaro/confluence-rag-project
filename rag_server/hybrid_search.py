@@ -63,15 +63,20 @@ def simple_tokenize(text: str) -> List[str]:
     return text.lower().split()
 
 
+# Ключевые слова для определения интента (в порядке приоритета)
+INTENT_KEYWORDS = {
+    QueryIntent.NAVIGATIONAL: ['где', 'url', 'ссылка', 'link', 'find', 'где найти', 'найди', 'покажи', 'страница', 'документ'],
+    QueryIntent.HOWTO: ['как', 'инструкция', 'настроить', 'установить', 'запустить', 'сделать'],
+    QueryIntent.FACTUAL: ['какой', 'какая', 'какие', 'что', 'когда', 'кто', 'сколько'],
+    QueryIntent.EXPLORATORY: ['какие', 'сравни', 'список', 'все', 'перечисли']
+}
+
+
 def detect_query_intent(query: str) -> QueryIntent:
     """
     Определить тип запроса для адаптивных весов.
 
-    Простые эвристики:
-    - Navigational: "где", "как найти", "url", "link", "страница"
-    - Exploratory: "какие", "сравни", "список", "все"
-    - Factual: "какой", "что", "когда", "кто"
-    - HowTo: "как", "инструкция", "настроить"
+    Простые эвристики на основе ключевых слов.
 
     Args:
         query: Поисковый запрос
@@ -81,25 +86,10 @@ def detect_query_intent(query: str) -> QueryIntent:
     """
     query_lower = query.lower()
 
-    # Navigational: поиск конкретной информации
-    navigational_keywords = ['где', 'url', 'ссылка', 'link', 'find', 'где найти', 'найди', 'покажи', 'страница', 'документ']
-    if any(kw in query_lower for kw in navigational_keywords):
-        return QueryIntent.NAVIGATIONAL
-
-    # HowTo: инструкции
-    howto_keywords = ['как', 'инструкция', 'настроить', 'установить', 'запустить', 'сделать']
-    if any(kw in query_lower for kw in howto_keywords):
-        return QueryIntent.HOWTO
-
-    # Factual: факты
-    factual_keywords = ['какой', 'какая', 'какие', 'что', 'когда', 'кто', 'сколько']
-    if any(kw in query_lower for kw in factual_keywords):
-        return QueryIntent.FACTUAL
-
-    # Exploratory: исследовательский поиск
-    exploratory_keywords = ['какие', 'сравни', 'список', 'все', 'перечисли']
-    if any(kw in query_lower for kw in exploratory_keywords):
-        return QueryIntent.EXPLORATORY
+    # Проверяем в порядке приоритета
+    for intent, keywords in INTENT_KEYWORDS.items():
+        if any(kw in query_lower for kw in keywords):
+            return intent
 
     # По умолчанию: Factual
     return QueryIntent.FACTUAL
@@ -133,6 +123,59 @@ def get_adaptive_weights(query_intent: QueryIntent) -> Tuple[float, float]:
     return vector_weight, bm25_weight
 
 
+def _load_documents_from_qdrant(collection_name: str, limit: int) -> dict:
+    """Загружает документы из Qdrant."""
+    # Ограничиваем для предотвращения OOM
+    MAX_DOCS = int(os.getenv("BM25_MAX_DOCS", "50000"))
+    actual_limit = min(limit, MAX_DOCS)
+
+    target_collection = collection_name or os.getenv("QDRANT_COLLECTION", "confluence_chunks")
+    logger.info(f"Загрузка документов для BM25 из коллекции: {target_collection} (limit={actual_limit})")
+
+    all_data = get_all_points(limit=actual_limit)
+
+    if not all_data or not all_data.get('ids'):
+        raise ValueError("Коллекция пуста или данные не получены")
+
+    return all_data
+
+
+def _prepare_bm25_corpus(all_data: dict) -> Tuple[List, List]:
+    """Подготавливает корпус и nodes для BM25."""
+    corpus_tokens = []
+    nodes = []
+    doc_count = len(all_data['ids'])
+
+    logger.info(f"Подготовка {doc_count} документов для BM25...")
+
+    for idx in range(doc_count):
+        doc_id = all_data['ids'][idx]
+        doc_text = all_data['documents'][idx]
+        doc_metadata = all_data['metadatas'][idx]
+
+        if doc_text and isinstance(doc_text, str):
+            tokens = simple_tokenize(doc_text)
+            corpus_tokens.append(tokens)
+            # Сохраняем структуру, похожую на PointStruct для совместимости
+            nodes.append({
+                'id': doc_id,
+                'payload': doc_metadata or {},
+                'text': doc_text
+            })
+
+    if not corpus_tokens:
+        raise ValueError("Не найдено текстового контента для индексации")
+
+    return corpus_tokens, nodes
+
+
+def _create_bm25_index(corpus_tokens: List) -> 'BM25Okapi':
+    """Создает BM25 индекс."""
+    from rank_bm25 import BM25Okapi
+    with timed_operation(BM25_LATENCY):
+        return BM25Okapi(corpus_tokens)
+
+
 def init_bm25_retriever(collection_name: str = None) -> bool:
     """
     Инициализирует BM25 index из документов Qdrant используя rank_bm25.
@@ -153,56 +196,16 @@ def init_bm25_retriever(collection_name: str = None) -> bool:
         return True
 
     try:
-        from rank_bm25 import BM25Okapi
-
-        # 1. Получаем все документы из Qdrant
-        # Используем глобальную коллекцию если не передана
-        target_collection = collection_name or os.getenv("QDRANT_COLLECTION", "confluence_chunks")
-
-        logger.info(f"Загрузка документов для BM25 из коллекции: {target_collection}")
-
-        # Получаем points (это наши чанки)
-        # Используем функцию из qdrant_storage для получения всех точек
-        # Она возвращает формат {'ids': [], 'documents': [], 'metadatas': []}
-        # Ограничиваем для предотвращения OOM
-        MAX_DOCS_FOR_BM25 = int(os.getenv("BM25_MAX_DOCS", "50000"))
-        all_data = get_all_points(limit=MAX_DOCS_FOR_BM25)
-
-        if not all_data or not all_data.get('ids'):
-            logger.warning("Коллекция пуста, BM25 не инициализирован")
-            return False
-
-        doc_count = len(all_data['ids'])
-        logger.info(f"Загрузка {doc_count} документов для BM25 индексации...")
+        # 1. Загружаем документы
+        all_data = _load_documents_from_qdrant(collection_name, 50000)
 
         # 2. Подготавливаем корпус
-        corpus_tokens = []
-        nodes = []
-
-        for idx in range(doc_count):
-            doc_id = all_data['ids'][idx]
-            doc_text = all_data['documents'][idx]
-            doc_metadata = all_data['metadatas'][idx]
-
-            if doc_text and isinstance(doc_text, str):
-                tokens = simple_tokenize(doc_text)
-                corpus_tokens.append(tokens)
-                # Сохраняем структуру, похожую на PointStruct для совместимости
-                nodes.append({
-                    'id': doc_id,
-                    'payload': doc_metadata or {},
-                    'text': doc_text
-                })
-
-        if not corpus_tokens:
-            logger.warning("Не найдено текстового контента для индексации BM25")
-            return False
+        corpus_tokens, nodes = _prepare_bm25_corpus(all_data)
 
         # 3. Создаем индекс
-        with timed_operation(BM25_LATENCY):
-            bm25_index = BM25Okapi(corpus_tokens)
-            bm25_corpus = corpus_tokens
-            bm25_nodes = nodes
+        bm25_index = _create_bm25_index(corpus_tokens)
+        bm25_corpus = corpus_tokens
+        bm25_nodes = nodes
 
         logger.info(f"✅ BM25 индекс создан. Индексировано {len(nodes)} документов.")
         return True

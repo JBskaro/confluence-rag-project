@@ -7,7 +7,7 @@ import os
 import logging
 import threading
 import time
-from typing import List, Optional, Union, Any
+from typing import List, Any
 
 # Отключаем избыточное логирование
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -68,15 +68,15 @@ class UnifiedEmbeddingModel:
                     input=[text]
                 )
                 return response.data[0].embedding
-            
+
             elif self.source == 'huggingface':
                 # Используем SentenceTransformer
                 embedding = self.client.encode(text, normalize_embeddings=False)
                 return embedding.tolist()
-            
+
             else:
                 raise ValueError(f"Unknown source: {self.source}")
-                
+
         except Exception as e:
             logger.error(f"Error generating embedding ({self.source}): {e}")
             # Возвращаем нулевой вектор в случае ошибки, чтобы не ронять процесс
@@ -98,15 +98,15 @@ class UnifiedEmbeddingModel:
                 )
                 # Гарантируем порядок
                 return [item.embedding for item in response.data]
-            
+
             elif self.source == 'huggingface':
                 # SentenceTransformer поддерживает batch
                 embeddings = self.client.encode(texts, normalize_embeddings=False)
                 return [emb.tolist() for emb in embeddings]
-            
+
             else:
                 return [self._generate_embedding(t) for t in texts]
-                
+
         except Exception as e:
             logger.error(f"Error generating batch embeddings: {e}")
             # Fallback to sequential
@@ -114,10 +114,83 @@ class UnifiedEmbeddingModel:
 
     def get_embedding_dimension(self) -> int:
         return self._dimension
-        
+
     @property
     def dimension(self) -> int:
         return self._dimension
+
+
+def _determine_source() -> str:
+    """Определяет источник embedding (legacy compatibility)."""
+    source = EMBEDDING_SOURCE
+
+    if not source:
+        if OPENAI_API_BASE:
+            source = 'openai'
+        elif USE_OLLAMA:
+            source = 'ollama'
+        else:
+            source = 'huggingface'
+
+    return source
+
+
+def _init_openai_embedding(
+    api_base: str,
+    api_key: str,
+    model_name: str
+) -> UnifiedEmbeddingModel:
+    """Инициализация OpenAI/OpenRouter embedding."""
+    from openai import OpenAI
+
+    if api_base and not api_base.endswith('/v1'):
+        api_base = f"{api_base}/v1"
+
+    client = OpenAI(base_url=api_base, api_key=api_key)
+
+    logger.info(f"Testing connection to {api_base} with model {model_name}...")
+    try:
+        resp = client.embeddings.create(model=model_name, input=["test"])
+        dim = len(resp.data[0].embedding)
+    except Exception as e:
+        logger.warning(f"Failed to test connection, using default dimension 1536: {e}")
+        dim = 1536  # Fallback default
+
+    return UnifiedEmbeddingModel('openai', model_name, dim, client)
+
+
+def _init_ollama_embedding(
+    api_base: str,
+    model_name: str
+) -> UnifiedEmbeddingModel:
+    """Инициализация Ollama embedding."""
+    from openai import OpenAI
+
+    if not api_base.endswith('/v1'):
+        api_base = f"{api_base}/v1"
+
+    client = OpenAI(base_url=api_base, api_key="ollama")
+
+    logger.info(f"Testing Ollama at {api_base} with model {model_name}...")
+    try:
+        resp = client.embeddings.create(model=model_name, input=["test"])
+        dim = len(resp.data[0].embedding)
+    except Exception as e:
+        logger.warning(f"Failed to test Ollama connection, using default dimension 1024: {e}")
+        dim = 1024  # Fallback default
+
+    return UnifiedEmbeddingModel('ollama', model_name, dim, client)
+
+
+def _init_huggingface_embedding(model_name: str) -> UnifiedEmbeddingModel:
+    """Инициализация HuggingFace embedding."""
+    from sentence_transformers import SentenceTransformer
+
+    logger.info(f"Loading HuggingFace model: {model_name}...")
+    client = SentenceTransformer(model_name)
+    dim = client.get_sentence_embedding_dimension()
+
+    return UnifiedEmbeddingModel('huggingface', model_name, dim, client)
 
 
 def get_embed_model() -> UnifiedEmbeddingModel:
@@ -125,83 +198,44 @@ def get_embed_model() -> UnifiedEmbeddingModel:
     Фабрика для получения модели embeddings.
     """
     global _embed_model
-    
+
     if _embed_model:
         return _embed_model
 
     with _model_lock:
         if _embed_model:
             return _embed_model
-            
+
         start_time = time.time()
-        source = EMBEDDING_SOURCE
-        
-        # Логика выбора источника (совместимость с legacy)
-        if not source:
-            if OPENAI_API_BASE:
-                source = 'openai'
-            elif USE_OLLAMA:
-                source = 'ollama'
-            else:
-                source = 'huggingface'
-        
+        source = _determine_source()
+
         logger.info(f"Initializing embedding model. Source: {source}")
 
         try:
-            if source == 'openrouter' or source == 'openai':
-                from openai import OpenAI
-                
+            if source in ('openrouter', 'openai'):
                 api_base = OPENAI_API_BASE
                 if not api_base and source == 'openrouter':
                     api_base = "https://openrouter.ai/api/v1"
                 
-                if api_base and not api_base.endswith('/v1'):
-                    api_base = f"{api_base}/v1"
-                    
-                api_key = OPENAI_API_KEY
                 model_name = OPENAI_MODEL or EMBED_MODEL
-                
-                client = OpenAI(base_url=api_base, api_key=api_key)
-                
-                # Test & get dimension
-                logger.info(f"Testing connection to {api_base} with model {model_name}...")
-                resp = client.embeddings.create(model=model_name, input=["test"])
-                dim = len(resp.data[0].embedding)
-                
-                _embed_model = UnifiedEmbeddingModel(source, model_name, dim, client)
-                
+                _embed_model = _init_openai_embedding(api_base, OPENAI_API_KEY, model_name)
+
             elif source == 'ollama':
-                # Ollama совместима с OpenAI API
-                from openai import OpenAI
-                
-                api_base = OLLAMA_URL
-                if not api_base.endswith('/v1'):
-                    api_base = f"{api_base}/v1"
-                    
-                model_name = os.getenv('OLLAMA_EMBEDDING_MODEL') or os.getenv('OLLAMA_MODEL') or EMBED_MODEL
-                
-                client = OpenAI(base_url=api_base, api_key="ollama")
-                
-                logger.info(f"Testing connection to Ollama at {api_base} with model {model_name}...")
-                resp = client.embeddings.create(model=model_name, input=["test"])
-                dim = len(resp.data[0].embedding)
-                
-                _embed_model = UnifiedEmbeddingModel(source, model_name, dim, client)
-                
+                model_name = (os.getenv('OLLAMA_EMBEDDING_MODEL') or 
+                            os.getenv('OLLAMA_MODEL') or EMBED_MODEL)
+                _embed_model = _init_ollama_embedding(OLLAMA_URL, model_name)
+
             elif source == 'huggingface':
-                from sentence_transformers import SentenceTransformer
-                
-                logger.info(f"Loading HuggingFace model: {EMBED_MODEL}...")
-                client = SentenceTransformer(EMBED_MODEL)
-                dim = client.get_sentence_embedding_dimension()
-                
-                _embed_model = UnifiedEmbeddingModel(source, EMBED_MODEL, dim, client)
-                
+                _embed_model = _init_huggingface_embedding(EMBED_MODEL)
+
             else:
                 raise ValueError(f"Unsupported embedding source: {source}")
-                
+
             elapsed = time.time() - start_time
-            logger.info(f"✅ Embedding model initialized in {elapsed:.2f}s. Dimension: {_embed_model.dimension}")
+            logger.info(
+                f"✅ Embedding model initialized in {elapsed:.2f}s. "
+                f"Dimension: {_embed_model.dimension}"
+            )
             return _embed_model
 
         except Exception as e:

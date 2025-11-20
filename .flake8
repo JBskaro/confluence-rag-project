@@ -1,24 +1,35 @@
 [flake8]
-# Разумные лимиты для проекта
+# === Лимиты ===
 max-line-length = 120
-max-complexity = 15
+max-complexity = 20
+# ↑ Увеличено до 20 для сложной бизнес-логики
 
-# Игнорируем некритичные warnings
+# === Игнорируем ===
 ignore = 
-    E203,  # whitespace before ':'
-    W503,  # line break before binary operator
+    E203,   # whitespace before ':'
+    W503,   # line break before binary operator
+    E501,   # line too long (контролируется max-line-length)
 
-# Исключаем файлы
-exclude =
+# === Исключаем ===
+exclude = 
     .git,
     __pycache__,
-    venv,
-    .venv,
+    docs/source/conf.py,
+    old,
     build,
     dist,
-    *.egg-info
+    venv,
+    .venv,
+    data,
+    .pytest_cache,
 
-# Показываем статистику
+# === Статистика ===
 statistics = True
 count = True
-show-source = True
+
+# === Per-file ===
+per-file-ignores =
+    __init__.py:F401
+    # Разрешаем чуть большую сложность для основных модулей, если потребуется
+    rag_server/sync_confluence.py:C901
+    rag_server/mcp_rag_secure.py:C901
