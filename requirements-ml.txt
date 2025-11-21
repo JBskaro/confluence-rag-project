@@ -9,6 +9,6 @@ huggingface-hub>=0.23.0,<1.0.0
 openai>=1.40.0
 
 # RAG evaluation
-ragas
-datasets
+ragas>=0.1.0
+datasets>=2.14.0
 

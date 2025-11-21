@@ -1,46 +1,13 @@
-# Core dependencies
-fastmcp>=0.2.0
-rank_bm25>=0.2.2
-langchain-text-splitters>=0.3.0
-qdrant-client>=1.11.0
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
+# Full installation (all dependencies)
+# Install with: pip install -r requirements.txt
+# This will install ~3-5GB of dependencies
 
-# Confluence
-atlassian-python-api>=3.41.0
-html2text>=2020.1.16
+# Include all requirement files
+-r requirements-core.txt
+-r requirements-ml.txt
+-r requirements-dev.txt
 
-# ML models
-torch>=2.0.0
-sentence-transformers>=2.7.0
-huggingface-hub>=0.23.0,<1.0.0
-openai>=1.40.0
-
-# HTTP & Networking
-httpx>=0.27.0
-tenacity>=8.2.0
-urllib3>=2.0.0,<3.0.0
-numpy>=1.24.0,<2.0.0
-
-# Observability
-opentelemetry-api>=1.20.0
-opentelemetry-sdk>=1.20.0
-opentelemetry-exporter-otlp>=1.20.0
-opentelemetry-instrumentation-httpx>=0.40b0
-prometheus-client>=0.17.0
-
-# Test dependencies
-pytest>=8.0.0
-pytest-cov>=4.1.0
-pytest-mock>=3.12.0
-pytest-asyncio>=0.21.0
-
-# Code quality tools
-mypy>=1.7.0
-flake8>=6.1.0
-black>=23.12.0
-isort>=5.13.0
-
-# RAG evaluation
-ragas
-datasets
+# NOTE: For lighter installation options:
+# - Core only (no ML): pip install -r requirements-core.txt (~200MB, 2-3 min)
+# - Core + ML: pip install -r requirements-core.txt -r requirements-ml.txt (~3GB, 10-20 min)
+# - Core + Dev: pip install -r requirements-core.txt -r requirements-dev.txt (~300MB, 3-5 min)
