@@ -8,40 +8,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Копирование requirements для кеширования слоя
+COPY requirements-core.txt .
+COPY requirements-ml.txt .
+COPY requirements-dev.txt .
 COPY requirements.txt .
 RUN pip install --no-cache-dir -q -r requirements.txt
 
-# Копирование кода приложения
-COPY rag_server/embeddings.py embeddings.py
-COPY rag_server/synonyms_manager.py synonyms_manager.py
-COPY rag_server/semantic_cache.py semantic_cache.py
-COPY rag_server/semantic_query_log.py semantic_query_log.py
-COPY rag_server/advanced_search.py advanced_search.py
-COPY rag_server/query_rewriter.py query_rewriter.py
-COPY rag_server/hybrid_search.py hybrid_search.py
-COPY rag_server/context_expansion.py context_expansion.py
-COPY rag_server/qdrant_storage.py qdrant_storage.py
-COPY rag_server/postgres_storage.py postgres_storage.py
-COPY rag_server/hallucination_detector.py hallucination_detector.py
-COPY rag_server/mmr_reranker.py mmr_reranker.py
-COPY rag_server/observability.py observability.py
-COPY rag_server/response_formatter.py response_formatter.py
-COPY rag_server/self_query_parser.py self_query_parser.py
-COPY rag_server/sync_confluence.py sync.py
-COPY rag_server/mcp_rag_secure.py server.py
-# Копирование utils модулей
-COPY rag_server/utils/ utils/
+# Копирование всего проекта
+COPY . .
 
 # Переменные окружения
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONIOENCODING=utf-8
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
+ENV PYTHONPATH=/app
 
 # Health check: проверяет MCP сервер
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
     CMD curl -f -H "Accept: application/json" http://localhost:8012/mcp || exit 0
 
-# Запуск sync и server
-# Модель инициализируется автоматически при импорте server.py (на уровне модуля)
-CMD ["bash", "-c", "python sync.py & python server.py"]
+# Запуск sync и server с правильными путями
+CMD ["bash", "-c", "python rag_server/sync_confluence.py & python rag_server/mcp_rag_secure.py"]

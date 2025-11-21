@@ -6,16 +6,16 @@ services:
     container_name: confluence-rag
     volumes:
       - ./data:/app/data
-      # chroma_data больше не нужен - Qdrant работает в отдельном контейнере
-      - ./rag_server:/app
+      # Mount root to /app to preserve rag_server package structure
+      - .:/app
     ports:
       - "8012:8012"
     networks:
       - vless-proxy
     env_file:
       - .env
-    # Запускаем оригинальные файлы, так как мы монтируем rag_server в /app
-    command: [ "bash", "-c", "python sync_confluence.py & python mcp_rag_secure.py" ]
+    # Запускаем из корня пакета
+    command: [ "bash", "-c", "python rag_server/sync_confluence.py & python rag_server/mcp_rag_secure.py" ]
     restart: unless-stopped
     logging:
       driver: "json-file"

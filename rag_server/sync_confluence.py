@@ -23,7 +23,6 @@ from atlassian import Confluence
 # llama-index импорты удалены - используем прямую работу с Qdrant
 # QdrantVectorStore используется только в qdrant_storage.py для поиска (get_qdrant_vector_store)
 from qdrant_storage import (
-    insert_chunk_to_qdrant,
     insert_chunks_batch_to_qdrant,
     init_qdrant_client
 )
@@ -168,7 +167,7 @@ from postgres_storage import (
 )
 from qdrant_storage import (
     init_qdrant_collection,
-    delete_points_by_page_id,
+    delete_points_by_page_ids,
     get_qdrant_count
 )
 
@@ -1458,7 +1457,7 @@ class BatchProcessor:
         """Индексация чанков в Qdrant."""
         # Удаляем старые
         try:
-            delete_points_by_page_id(page_id)
+            delete_points_by_page_ids([page_id])
         except Exception as e:
             logger.warning(f"Ошибка удаления старых чанков для {page_id}: {e}")
 
@@ -1495,13 +1494,6 @@ class BatchProcessor:
             success, failed = insert_chunks_batch_to_qdrant(qdrant_client, chunks_to_insert, batch_size=100)
             if failed > 0:
                  logger.warning(f"Failed to insert {failed} chunks for {page_id}")
-        else:
-            for chunk in chunks_to_insert:
-                insert_chunk_to_qdrant(
-                    client=qdrant_client, chunk_text=chunk['text'],
-                    metadata=chunk['metadata'], embedding=chunk['embedding'],
-                    point_id=chunk['point_id']
-                )
 
     def _process_page_logic(self, page_id: str, title: str, qdrant_client: Any,
                           confluence: Confluence, space_key: str) -> bool:
@@ -1676,8 +1668,9 @@ def cleanup_deleted_pages(qdrant_client: Any, state: Dict[str, Any], current_pag
     for page_id in deleted_page_ids:
         try:
             # Удаление всех чанков этой страницы из Qdrant
-            if delete_points_by_page_id(page_id):
-                logger.info(f"  Удалена страница {page_id} из Qdrant")
+            deleted_count = delete_points_by_page_ids([page_id])
+            if deleted_count > 0:
+                logger.info(f"  Удалена страница {page_id} из Qdrant ({deleted_count} чанков)")
 
             # Удаление из state
             if page_id in state['pages']:

@@ -563,3 +563,88 @@ def delete_points_by_page_ids(page_ids: List[str], chunk_size: int = 500) -> int
             continue
 
     return total_deleted
+
+def get_points_by_filter(
+    where_filter: Dict,
+    limit: int = 100,
+    collection: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Получить точки из Qdrant по фильтру метаданных.
+    
+    Args:
+        where_filter: Фильтр в формате {'$and': [{'page_id': 'xxx'}, {'chunk': {'$gte': 1}}]}
+        limit: Максимальное количество результатов
+        collection: Имя коллекции (по умолчанию из settings)
+    
+    Returns:
+        Список документов с text и metadata
+    """
+    client = init_qdrant_client()
+    collection_name = collection or settings.qdrant_collection
+    
+    # Парсим фильтр
+    must_conditions = []
+    if '$and' in where_filter:
+        for condition in where_filter['$and']:
+            for key, value in condition.items():
+                if isinstance(value, dict):
+                    # Range фильтр ($gte, $lte, $gt, $lt)
+                    range_params = {}
+                    if '$gte' in value:
+                        range_params['gte'] = value['$gte']
+                    if '$lte' in value:
+                        range_params['lte'] = value['$lte']
+                    if '$gt' in value:
+                        range_params['gt'] = value['$gt']
+                    if '$lt' in value:
+                        range_params['lt'] = value['$lt']
+                    must_conditions.append(
+                        FieldCondition(key=key, range=Range(**range_params))
+                    )
+                else:
+                    # Exact match
+                    must_conditions.append(
+                        FieldCondition(key=key, match=MatchValue(value=value))
+                    )
+    else:
+        # Простой фильтр без $and
+        for key, value in where_filter.items():
+            if isinstance(value, dict) and any(k in value for k in ['$gte', '$lte', '$gt', '$lt']):
+                range_params = {}
+                if '$gte' in value:
+                    range_params['gte'] = value['$gte']
+                if '$lte' in value:
+                    range_params['lte'] = value['$lte']
+                if '$gt' in value:
+                    range_params['gt'] = value['$gt']
+                if '$lt' in value:
+                    range_params['lt'] = value['$lt']
+                must_conditions.append(
+                    FieldCondition(key=key, range=Range(**range_params))
+                )
+            else:
+                must_conditions.append(
+                    FieldCondition(key=key, match=MatchValue(value=value))
+                )
+    
+    try:
+        scroll_result = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=Filter(must=must_conditions) if must_conditions else None,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False
+        )
+        points, _ = scroll_result
+        
+        return [
+            {
+                'text': extract_text_from_payload(point.payload),
+                'metadata': {k: v for k, v in point.payload.items() if k not in ['text', '_node_content']}
+            }
+            for point in points
+        ]
+    except Exception as e:
+        logger.error(f"Ошибка get_points_by_filter: {e}")
+        return []
