@@ -153,6 +153,11 @@ except ImportError:
         def labels(self, **kwargs) -> 'DummyMetric': return self
         def info(self, info: dict) -> None: pass
 
+    Histogram = Any
+    Counter = Any
+    Gauge = Any
+    Info = Any
+
     SEARCH_LATENCY = DummyMetric()
     RERANK_LATENCY = DummyMetric()
     BM25_LATENCY = DummyMetric()

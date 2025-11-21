@@ -1,251 +1,109 @@
-"""
-Pytest configuration и общие fixtures.
-"""
+"""Shared pytest fixtures"""
 import pytest
-from unittest.mock import Mock, MagicMock
 import sys
 import os
+from unittest.mock import Mock, AsyncMock
 
-# Добавляем rag_server в путь
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'rag_server'))
+# Add rag_server to sys.path to allow imports like 'from embeddings import ...'
+# which are used inside the source files
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'rag_server')))
+# Also add the root directory
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+from rag_server.config import Settings
 
 @pytest.fixture
-def mock_confluence():
-    """Mock Confluence API client."""
-    mock = Mock()
-    mock.get_page_by_id.return_value = {
-        'id': '12345',
-        'title': 'Test Page',
-        'version': {
-            'number': 1,
-            'when': '2024-01-15T10:30:00.000Z',
-            'by': {'displayName': 'Test User'}
-        },
-        'body': {
-            'storage': {
-                'value': '<p>Test content</p>'
-            }
-        },
-        'metadata': {
-            'labels': {
-                'results': [{'name': 'test'}]
-            }
-        },
-        'ancestors': [],
-        'children': {'page': {'size': 0}}
-    }
-    mock.get_all_spaces.return_value = {
-        'results': [
-            {'key': 'TEST', 'name': 'Test Space'}
-        ]
-    }
-    mock.get_all_pages_from_space.return_value = [
+def test_settings():
+    """Тестовые настройки"""
+    return Settings(
+        qdrant_host="localhost",
+        qdrant_port=6333,
+        qdrant_collection="test_collection",
+        enable_hybrid_search=True,
+        enable_context_expansion=True,
+        enable_metrics=False,
+        enable_tracing=False,
+    )
+
+@pytest.fixture
+def mock_embedding_384():
+    """Mock embedding 384D"""
+    return [0.1] * 384
+
+@pytest.fixture
+def mock_embedding_768():
+    """Mock embedding 768D"""
+    return [0.1] * 768
+
+@pytest.fixture
+def sample_documents():
+    """Тестовые документы"""
+    return [
         {
-            'id': '12345',
-            'title': 'Test Page',
-            'version': {'when': '2024-01-15T10:30:00.000Z'}
-        }
+            'id': 'doc-1',
+            'text': 'This is document 1 about Python programming.',
+            'metadata': {'space': 'DOCS', 'page_id': 'page-1'}
+        },
+        {
+            'id': 'doc-2',
+            'text': 'This is document 2 about machine learning.',
+            'metadata': {'space': 'DOCS', 'page_id': 'page-2'}
+        },
+        {
+            'id': 'doc-3',
+            'text': 'This is document 3 about data science.',
+            'metadata': {'space': 'TECH', 'page_id': 'page-3'}
+        },
     ]
-    return mock
-
 
 @pytest.fixture
-def mock_chromadb_collection():
-    """Mock ChromaDB collection."""
-    mock = Mock()
-    mock.get.return_value = {
-        'ids': ['id1', 'id2'],
-        'metadatas': [
-            {
-                'page_id': 'page1',
-                'title': 'Page 1',
-                'space': 'TEST',
-                'chunk': 0,
-                'url': 'http://test.com/1',
-                'labels': 'test',
-                'parent_title': ''
-            }
-        ]
-    }
-    mock.count.return_value = 100
-    mock.delete.return_value = None
-    return mock
+def mock_qdrant_client():
+    """Mock QdrantClient"""
+    client = Mock()
+    client.search = Mock(return_value=[])
+    client.scroll = Mock(return_value=([], None))
+    return client
 
+from qdrant_client import AsyncQdrantClient
 
 @pytest.fixture
-def mock_chroma_client(mock_chromadb_collection):
-    """Mock ChromaDB client."""
-    mock = Mock()
-    mock.get_or_create_collection.return_value = mock_chromadb_collection
-    return mock
-
-
-@pytest.fixture
-def sample_confluence_page():
-    """Sample Confluence page data."""
-    return {
-        'id': '123456',
-        'title': 'Sample Page',
-        'type': 'page',
-        'space': {'key': 'TEST'},
-        'version': {
-            'number': 5,
-            'when': '2024-01-15T10:30:00.000Z',
-            'by': {'displayName': 'John Doe'}
-        },
-        'body': {
-            'storage': {
-                'value': '''
-                <h1>Main Heading</h1>
-                <p>Some content</p>
-                <ac:structured-macro ac:name="info">
-                    <ac:rich-text-body>Important information</ac:rich-text-body>
-                </ac:structured-macro>
-                '''
-            }
-        },
-        'metadata': {
-            'labels': {
-                'results': [
-                    {'name': 'important'},
-                    {'name': 'documentation'}
-                ]
-            }
-        },
-        'ancestors': [
-            {'id': '111', 'title': 'Parent Page'}
-        ],
-        'children': {
-            'page': {'size': 3}
-        }
-    }
-
+def mock_async_qdrant_client():
+    """Mock AsyncQdrantClient"""
+    client = AsyncMock(spec=AsyncQdrantClient)
+    client.search = AsyncMock(return_value=[])
+    client.scroll = AsyncMock(return_value=([], None))
+    return client
 
 @pytest.fixture
-def sample_html_with_macros():
-    """Sample HTML с Confluence макросами."""
-    return '''
-    <h1>Test Document</h1>
-    <p>Introduction text</p>
-    
-    <ac:structured-macro ac:name="info">
-        <ac:rich-text-body>
-            <p>This is important information</p>
-        </ac:rich-text-body>
-    </ac:structured-macro>
-    
-    <ac:structured-macro ac:name="warning">
-        <ac:rich-text-body>
-            <p>This is a warning</p>
-        </ac:rich-text-body>
-    </ac:structured-macro>
-    
-    <ac:structured-macro ac:name="code">
-        <ac:parameter ac:name="language">python</ac:parameter>
-        <ac:plain-text-body><![CDATA[
-def hello_world():
-    print("Hello, World!")
-        ]]></ac:plain-text-body>
-    </ac:structured-macro>
-    
-    <h2>Section 1</h2>
-    <p>Section content</p>
-    '''
+def mock_embeddings_model():
+    """Mock embeddings model"""
+    model = AsyncMock()
+    model.get_query_embedding_async = AsyncMock(return_value=[0.1] * 384)
+    model.get_text_embeddings_async = AsyncMock(return_value=[[0.1] * 384])
+    return model
 
-
-@pytest.fixture
-def sample_markdown_text():
-    """Sample markdown text с заголовками."""
-    return '''# Main Heading
-
-Some introduction text here.
-
-## Section 1
-
-Content of section 1 with multiple paragraphs.
-
-This is the second paragraph in section 1.
-
-### Subsection 1.1
-
-Detailed content in subsection.
-
-## Section 2
-
-Content of section 2.
-
-### Subsection 2.1
-
-More detailed content.
-
-#### Sub-subsection 2.1.1
-
-Even more detailed content.
-'''
-
-
-@pytest.fixture
-def mock_llama_index_retriever():
-    """Mock LlamaIndex retriever."""
-    mock = Mock()
-    mock_result = Mock()
-    mock_result.text = "Sample retrieved text"
-    mock_result.metadata = {
-        'title': 'Test Page',
-        'space': 'TEST',
-        'chunk': 0,
-        'url': 'http://test.com',
-        'heading': 'Section',
-        'heading_level': 2,
-        'labels': 'test',
-        'parent_title': '',
-        'created_by': 'User',
-        'attachments': ''
-    }
-    mock.retrieve.return_value = [mock_result]
-    return mock
-
-
-@pytest.fixture
-def mock_vector_index(mock_llama_index_retriever):
-    """Mock VectorStoreIndex."""
-    mock = Mock()
-    mock.as_retriever.return_value = mock_llama_index_retriever
-    mock.insert.return_value = None
-    return mock
-
+from rag_server.config import settings as global_settings
 
 @pytest.fixture(autouse=True)
-def reset_environment():
-    """Reset environment variables before each test."""
-    original_env = os.environ.copy()
-    yield
-    os.environ.clear()
-    os.environ.update(original_env)
-
-
-@pytest.fixture
-def temp_state_file(tmp_path):
-    """Временный файл состояния для тестов."""
-    state_file = tmp_path / "sync_state.json"
-    return str(state_file)
-
-
-@pytest.fixture
-def sample_sync_state():
-    """Sample sync state."""
-    return {
-        'last_sync': 1234567890,
-        'pages': {
-            '12345': {
-                'updated': 20240115,
-                'chunks': 5
-            },
-            '67890': {
-                'updated': 20240116,
-                'chunks': 3
-            }
-        }
-    }
-
+def setup_test_settings():
+    """Override global settings for tests"""
+    # Save original values
+    original_qdrant_host = global_settings.qdrant_host
+    original_expansion = global_settings.enable_context_expansion
+    original_hybrid = global_settings.enable_hybrid_search
+    
+    # Set test values
+    global_settings.qdrant_host = "localhost"
+    global_settings.qdrant_port = 6333
+    global_settings.qdrant_collection = "test_collection"
+    global_settings.enable_hybrid_search = True
+    global_settings.enable_context_expansion = True
+    global_settings.enable_metrics = False
+    global_settings.enable_tracing = False
+    
+    yield global_settings
+    
+    # Restore (optional, but good practice)
+    global_settings.qdrant_host = original_qdrant_host
+    global_settings.enable_context_expansion = original_expansion
+    global_settings.enable_hybrid_search = original_hybrid
