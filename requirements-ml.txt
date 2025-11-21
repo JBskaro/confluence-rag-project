@@ -1,0 +1,14 @@
+# ML models and embeddings (heavy dependencies)
+# Install with: pip install -r requirements-core.txt -r requirements-ml.txt
+
+torch>=2.0.0
+sentence-transformers>=2.7.0
+huggingface-hub>=0.23.0,<1.0.0
+
+# Optional: OpenAI/OpenRouter
+openai>=1.40.0
+
+# RAG evaluation
+ragas
+datasets
+

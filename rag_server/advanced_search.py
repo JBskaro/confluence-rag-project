@@ -13,13 +13,10 @@ from typing import List, Dict, Any, Optional, Callable, Tuple
 from collections import Counter
 from functools import lru_cache
 
-logger = logging.getLogger(__name__)
+# Конфигурация из Pydantic
+from rag_server.config import settings
 
-# Конфигурация
-USE_OLLAMA_FOR_QUERY_EXPANSION = os.getenv("USE_OLLAMA_FOR_QUERY_EXPANSION", "false").lower() == "true"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-ENABLE_PRF_FALLBACK = os.getenv("ENABLE_PRF_FALLBACK", "true").lower() == "true"
+logger = logging.getLogger(__name__)
 
 
 def extract_keywords(text: str, min_length: int = 3) -> list:
@@ -128,9 +125,9 @@ def _call_ollama_api(prompt: str, timeout: int = 5) -> Optional[str]:
         import requests
         
         response = requests.post(
-            f"{OLLAMA_URL}/api/generate",
+            f"{settings.ollama_url}/api/generate",
             json={
-                "model": OLLAMA_MODEL,
+                "model": settings.ollama_model,
                 "prompt": prompt,
                 "stream": False,
                 "options": {"temperature": 0.3, "num_predict": 100}
@@ -162,7 +159,7 @@ def _parse_query_variants(generated_text: str) -> List[str]:
 @lru_cache(maxsize=100)
 def _cached_ollama_rewrite(query: str) -> tuple:
     """Кэширует Ollama варианты."""
-    if not USE_OLLAMA_FOR_QUERY_EXPANSION:
+    if not settings.use_ollama_for_query_expansion:
         return (query,)
 
     prompt = f"""Сгенерируй 2 альтернативных варианта этого поискового запроса, используя синонимы и перефразирование. Запросы должны быть на том же языке, что и исходный.
@@ -287,7 +284,7 @@ class FallbackSearch:
             results = []
 
         # Level 3: PRF (Pseudo-Relevance Feedback)
-        if ENABLE_PRF_FALLBACK and results:
+        if settings.enable_prf_fallback and results:
             try:
                 expanded_query = pseudo_relevance_feedback(query, results)
                 if expanded_query != query:
@@ -304,7 +301,6 @@ class FallbackSearch:
         return results, ""
 
 
-
 # Глобальный экземпляр
 _fallback_search = None
 
@@ -314,4 +310,3 @@ def get_fallback_search(min_results: int = 3) -> FallbackSearch:
     if _fallback_search is None:
         _fallback_search = FallbackSearch(min_results=min_results)
     return _fallback_search
-

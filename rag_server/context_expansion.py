@@ -10,16 +10,14 @@ Context Expansion: Bidirectional + Related chunks
 - all: все режимы вместе
 """
 
-import os
 import logging
+import asyncio
 from typing import Dict, Any, Optional, List, Tuple
 
-logger = logging.getLogger(__name__)
+# Pydantic config
+from rag_server.config import settings
 
-# Конфигурация через ENV
-ENABLE_CONTEXT_EXPANSION = os.getenv("ENABLE_CONTEXT_EXPANSION", "true").lower() == "true"
-CONTEXT_EXPANSION_MODE = os.getenv("CONTEXT_EXPANSION_MODE", "bidirectional").lower()
-CONTEXT_EXPANSION_SIZE = int(os.getenv("CONTEXT_EXPANSION_SIZE", "2"))  # ±N chunks
+logger = logging.getLogger(__name__)
 
 
 def _validate_result_and_collection(
@@ -61,13 +59,46 @@ def _default_result(result: Dict[str, Any], mode: str = 'none') -> Dict[str, Any
     return result
 
 
-def _get_page_chunks(collection: Any, page_id: str) -> Optional[Dict]:
-    """Получает все чанки страницы."""
+async def _get_page_chunks_async(collection: Any, page_id: str) -> Optional[Dict]:
+    """Получает все чанки страницы (Async)."""
     try:
-        return collection.get(
-            where={'page_id': page_id},
-            include=['documents', 'metadatas', 'ids']
-        )
+        # Проверяем, является ли collection AsyncQdrantClient
+        # В Qdrant API методы называются scroll/search, а не get
+        # Но в qdrant_storage есть обертки.
+        # Если collection - это raw QdrantClient (Async), используем scroll
+        from qdrant_client import AsyncQdrantClient
+        from qdrant_client.http import models
+
+        if isinstance(collection, AsyncQdrantClient):
+            # Используем scroll для получения всех точек с фильтром
+            points, _ = await collection.scroll(
+                collection_name=settings.qdrant_collection,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="metadata.page_id",
+                            match=models.MatchValue(value=page_id)
+                        )
+                    ]
+                ),
+                limit=100, # Ограничение на количество чанков страницы
+                with_payload=True,
+                with_vectors=False # Векторы не нужны, только текст
+            )
+            
+            return {
+                'documents': [p.payload.get('text', '') for p in points],
+                'metadatas': [p.payload for p in points],
+                'ids': [p.id for p in points]
+            }
+        else:
+            # Fallback for sync client or Chroma-like interface (deprecated but kept for safety)
+            # В новой архитектуре мы используем QdrantClient напрямую или через qdrant_storage helpers
+            # Но qdrant_storage helpers пока не экспортированы сюда.
+            # Предполагаем, что collection - это AsyncQdrantClient
+            logger.warning(f"Unknown collection type in context expansion: {type(collection)}")
+            return None
+
     except Exception as e:
         logger.warning(f"Error getting page chunks: {e}")
         return None
@@ -88,17 +119,17 @@ def _compute_similarity(emb1: List[float], emb2: List[float]) -> float:
         return 0.0
 
 
-def _find_similar_chunks_with_embeddings(
+async def _find_similar_chunks_with_embeddings_async(
     current_text: str,
     current_id: str,
     page_chunks: Dict,
     embeddings_model: Any
 ) -> List[Dict]:
-    """Находит похожие чанки через embeddings."""
+    """Находит похожие чанки через embeddings (Async)."""
     similar_chunks = []
     
     try:
-        current_embedding = embeddings_model.get_query_embedding(current_text)
+        current_embedding = await embeddings_model.get_query_embedding_async(current_text)
         
         # Оптимизация: Batch embedding generation
         chunk_texts = []
@@ -116,10 +147,13 @@ def _find_similar_chunks_with_embeddings(
 
         # Пытаемся получить batch embeddings
         try:
-            chunk_embeddings = embeddings_model.get_text_embeddings(chunk_texts)
+            chunk_embeddings = await embeddings_model.get_text_embeddings_async(chunk_texts)
         except Exception:
             # Fallback to sequential
-            chunk_embeddings = [embeddings_model.get_query_embedding(t) for t in chunk_texts]
+            chunk_embeddings = []
+            for t in chunk_texts:
+                emb = await embeddings_model.get_query_embedding_async(t)
+                chunk_embeddings.append(emb)
             
         for idx, embedding in enumerate(chunk_embeddings):
             original_idx = chunk_indices[idx]
@@ -164,54 +198,72 @@ def _find_similar_chunks_simple(
     return similar_chunks
 
 
-def _get_bidirectional_chunks(
+async def _get_bidirectional_chunks_async(
     collection: Any,
     page_id: str,
     chunk_num: int,
     context_size: int
 ) -> List[Dict]:
-    """Получает соседние чанки (±N)."""
+    """Получает соседние чанки (±N) (Async)."""
     min_chunk = max(0, chunk_num - context_size)
     max_chunk = chunk_num + context_size
 
-    neighbors = collection.get(
-        where={
-            '$and': [
-                {'page_id': page_id},
-                {'chunk': {'$gte': min_chunk}},
-                {'chunk': {'$lte': max_chunk}}
-            ]
-        },
-        include=['documents', 'metadatas']
-    )
+    try:
+        from qdrant_client import AsyncQdrantClient
+        from qdrant_client.http import models
 
-    chunk_data = []
-    if (neighbors and neighbors.get('documents') and 
-        len(neighbors['documents']) == len(neighbors.get('metadatas', []))):
-        
-        for i, doc in enumerate(neighbors['documents']):
-            chunk_meta = neighbors['metadatas'][i]
-            if chunk_meta:
-                chunk_data.append({
-                    'chunk_num': chunk_meta.get('chunk', 0),
-                    'text': doc if doc else ''
-                })
-                
-        chunk_data.sort(key=lambda x: x['chunk_num'])
-        
-    return chunk_data
+        if isinstance(collection, AsyncQdrantClient):
+            # Используем scroll с фильтром по диапазону chunk
+            points, _ = await collection.scroll(
+                collection_name=settings.qdrant_collection,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="metadata.page_id",
+                            match=models.MatchValue(value=page_id)
+                        ),
+                        models.FieldCondition(
+                            key="metadata.chunk",
+                            range=models.Range(gte=min_chunk, lte=max_chunk)
+                        )
+                    ]
+                ),
+                limit=100,
+                with_payload=True,
+                with_vectors=False
+            )
+            
+            chunk_data = []
+            for p in points:
+                chunk_meta = p.payload
+                if chunk_meta:
+                    chunk_data.append({
+                        'chunk_num': chunk_meta.get('chunk', 0),
+                        'text': chunk_meta.get('text', '') # В Qdrant текст часто дублируется в payload для удобства
+                    })
+            
+            chunk_data.sort(key=lambda x: x['chunk_num'])
+            return chunk_data
+            
+        else:
+            logger.warning(f"Unknown collection type: {type(collection)}")
+            return []
+
+    except Exception as e:
+        logger.warning(f"Error getting bidirectional chunks: {e}")
+        return []
 
 
-def expand_context_bidirectional(
+async def expand_context_bidirectional_async(
     result: Dict[str, Any],
     collection: Any,
     context_size: int = None
 ) -> Dict[str, Any]:
     """
-    Расширить контекст bidirectionally (±N chunks).
+    Расширить контекст bidirectionally (±N chunks) (Async).
     """
     if context_size is None:
-        context_size = CONTEXT_EXPANSION_SIZE
+        context_size = settings.context_expansion_size
 
     validation = _validate_result_and_collection(result, collection)
     if not validation:
@@ -221,10 +273,16 @@ def expand_context_bidirectional(
     chunk_num = result.get('metadata', {}).get('chunk', 0)
 
     try:
-        chunk_data = _get_bidirectional_chunks(collection, page_id, chunk_num, context_size)
+        chunk_data = await _get_bidirectional_chunks_async(collection, page_id, chunk_num, context_size)
         
         if chunk_data:
+            # Фильтруем пустые тексты
             expanded_text = '\n\n'.join([c['text'] for c in chunk_data if c['text']])
+            
+            # Если текст пустой (например, не было в payload), пробуем взять исходный result text
+            if not expanded_text and result.get('text'):
+                 expanded_text = result.get('text')
+
             result['expanded_text'] = expanded_text
             result['context_chunks'] = len(chunk_data)
             result['expansion_mode'] = 'bidirectional'
@@ -240,14 +298,14 @@ def expand_context_bidirectional(
     return result
 
 
-def expand_context_with_related(
+async def expand_context_with_related_async(
     result: Dict[str, Any],
     collection: Any,
     embeddings_model: Any = None,
     top_k: int = 2
 ) -> Dict[str, Any]:
     """
-    Добавить похожие чанки на той же странице.
+    Добавить похожие чанки на той же странице (Async).
     """
     validation = _validate_result_and_collection(result, collection)
     if not validation:
@@ -256,12 +314,12 @@ def expand_context_with_related(
     page_id, text, current_id = validation
 
     try:
-        page_chunks = _get_page_chunks(collection, page_id)
+        page_chunks = await _get_page_chunks_async(collection, page_id)
         if not page_chunks or not page_chunks.get('documents'):
             return _default_result(result)
 
         if embeddings_model:
-            similar_chunks = _find_similar_chunks_with_embeddings(
+            similar_chunks = await _find_similar_chunks_with_embeddings_async(
                 text, current_id, page_chunks, embeddings_model
             )
         else:
@@ -290,7 +348,7 @@ def expand_context_with_related(
     return result
 
 
-def expand_context_full(
+async def expand_context_full_async(
     result: Dict[str, Any],
     collection: Any,
     embeddings_model: Any = None,
@@ -298,11 +356,11 @@ def expand_context_full(
     context_size: int = None
 ) -> Dict[str, Any]:
     """
-    Полная context expansion с выбором режима.
+    Полная context expansion с выбором режима (Async).
 
     Args:
         result: Результат поиска
-        collection: ChromaDB коллекция
+        collection: QdrantClient (Async)
         embeddings_model: Модель для вычисления embeddings (опционально)
         expansion_mode: Режим расширения ('bidirectional', 'related', 'parent', 'all')
         context_size: Размер контекста для bidirectional режима
@@ -310,35 +368,35 @@ def expand_context_full(
     Returns:
         Результат с расширенным контекстом
     """
-    if not ENABLE_CONTEXT_EXPANSION:
+    if not settings.enable_context_expansion:
         result['expanded_text'] = result.get('text', '')
         result['context_chunks'] = 1
         result['expansion_mode'] = 'disabled'
         return result
 
     if expansion_mode is None:
-        expansion_mode = CONTEXT_EXPANSION_MODE
+        expansion_mode = settings.context_expansion_mode
 
     if context_size is None:
-        context_size = CONTEXT_EXPANSION_SIZE
+        context_size = settings.context_expansion_size
 
     try:
         if expansion_mode == 'bidirectional':
-            result = expand_context_bidirectional(result, collection, context_size)
+            result = await expand_context_bidirectional_async(result, collection, context_size)
         elif expansion_mode == 'related':
-            result = expand_context_with_related(result, collection, embeddings_model, top_k=context_size)
+            result = await expand_context_with_related_async(result, collection, embeddings_model, top_k=context_size)
         elif expansion_mode == 'parent':
             # Режим parent: используем bidirectional как основу
-            result = expand_context_bidirectional(result, collection, context_size)
+            result = await expand_context_bidirectional_async(result, collection, context_size)
             # TODO: Добавить логику для родительских разделов
         elif expansion_mode == 'all':
             # Все режимы вместе: сначала bidirectional, потом related
-            result = expand_context_bidirectional(result, collection, context_size)
-            result = expand_context_with_related(result, collection, embeddings_model, top_k=context_size)
+            result = await expand_context_bidirectional_async(result, collection, context_size)
+            result = await expand_context_with_related_async(result, collection, embeddings_model, top_k=context_size)
             result['expansion_mode'] = 'all'
         else:
             logger.warning(f"Неизвестный режим expansion: {expansion_mode}, используем bidirectional")
-            result = expand_context_bidirectional(result, collection, context_size)
+            result = await expand_context_bidirectional_async(result, collection, context_size)
 
         logger.debug(f"Context expansion ({expansion_mode}): применён к результату")
 
@@ -349,4 +407,3 @@ def expand_context_full(
         result['expansion_mode'] = 'error'
 
     return result
-

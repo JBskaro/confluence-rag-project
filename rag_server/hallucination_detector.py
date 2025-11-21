@@ -12,6 +12,9 @@ import numpy as np
 import logging
 from typing import List, Dict, Any, Tuple, Optional
 
+# Pydantic config
+from rag_server.config import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -135,7 +138,6 @@ class HallucinationDetector:
 
     def detect(
         self,
-        query: str,
         response: str,
         retrieved_docs: List[str],
         response_embedding: Optional[np.ndarray] = None,
@@ -145,7 +147,6 @@ class HallucinationDetector:
         Detect hallucinations в response.
 
         Args:
-            query: Исходный query
             response: Ответ модели
             retrieved_docs: Список документов из retrieval
             response_embedding: Embedding ответа (optional)
@@ -304,10 +305,17 @@ def detect_hallucination(
     Returns:
         (is_hallucination, details)
     """
-    detector = HallucinationDetector()
+    # Check settings
+    if not settings.enable_hallucination_detection:
+        return False, {"status": "disabled"}
+
+    # Use settings for threshold
+    detector = HallucinationDetector(
+        similarity_threshold=settings.hallucination_threshold,
+        keyword_overlap_threshold=settings.hallucination_keyword_overlap
+    )
 
     result = detector.detect(
-        query="",  # Not used in basic detection
         response=response,
         retrieved_docs=retrieved_docs,
         response_embedding=response_embedding,
@@ -315,4 +323,3 @@ def detect_hallucination(
     )
 
     return result['is_hallucination'], result
-

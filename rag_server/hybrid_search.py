@@ -6,11 +6,18 @@ Hybrid Search: Vector + BM25 (full-text search)
 Это стандартный подход, используемый Google, OpenAI, Meta, Microsoft, AWS.
 """
 
-import os
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+import asyncio
+from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 from collections import defaultdict
 from enum import Enum
+
+# Pydantic config
+from rag_server.config import settings
+
+# Type checking imports (avoid runtime import errors)
+if TYPE_CHECKING:
+    from rank_bm25 import BM25Okapi
 
 # Импортируем функцию для получения документов из Qdrant
 try:
@@ -32,25 +39,6 @@ class QueryIntent(Enum):
     FACTUAL = "factual"            # Фактический поиск
     HOWTO = "howto"                # Инструкции (как сделать)
 
-
-# Конфигурация через ENV
-ENABLE_HYBRID_SEARCH = os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true"
-VECTOR_WEIGHT = float(os.getenv("HYBRID_VECTOR_WEIGHT", "0.6"))  # Вес векторного поиска (по умолчанию)
-BM25_WEIGHT = float(os.getenv("HYBRID_BM25_WEIGHT", "0.4"))      # Вес BM25 поиска (по умолчанию)
-RRF_K = int(os.getenv("HYBRID_RRF_K", "60"))                     # Параметр RRF (стандарт: 60)
-
-# Адаптивные веса для разных типов запросов
-VECTOR_WEIGHT_NAVIGATIONAL = float(os.getenv("HYBRID_VECTOR_WEIGHT_NAVIGATIONAL", "0.7"))
-BM25_WEIGHT_NAVIGATIONAL = float(os.getenv("HYBRID_BM25_WEIGHT_NAVIGATIONAL", "0.3"))
-
-VECTOR_WEIGHT_EXPLORATORY = float(os.getenv("HYBRID_VECTOR_WEIGHT_EXPLORATORY", "0.5"))
-BM25_WEIGHT_EXPLORATORY = float(os.getenv("HYBRID_BM25_WEIGHT_EXPLORATORY", "0.5"))
-
-VECTOR_WEIGHT_FACTUAL = float(os.getenv("HYBRID_VECTOR_WEIGHT_FACTUAL", "0.6"))
-BM25_WEIGHT_FACTUAL = float(os.getenv("HYBRID_BM25_WEIGHT_FACTUAL", "0.4"))
-
-VECTOR_WEIGHT_HOWTO = float(os.getenv("HYBRID_VECTOR_WEIGHT_HOWTO", "0.55"))
-BM25_WEIGHT_HOWTO = float(os.getenv("HYBRID_BM25_WEIGHT_HOWTO", "0.45"))
 
 # Глобальный BM25 индекс (ленивая инициализация)
 bm25_index = None
@@ -106,13 +94,13 @@ def get_adaptive_weights(query_intent: QueryIntent) -> Tuple[float, float]:
         Tuple[vector_weight, bm25_weight]
     """
     weights = {
-        QueryIntent.NAVIGATIONAL: (VECTOR_WEIGHT_NAVIGATIONAL, BM25_WEIGHT_NAVIGATIONAL),
-        QueryIntent.EXPLORATORY: (VECTOR_WEIGHT_EXPLORATORY, BM25_WEIGHT_EXPLORATORY),
-        QueryIntent.FACTUAL: (VECTOR_WEIGHT_FACTUAL, BM25_WEIGHT_FACTUAL),
-        QueryIntent.HOWTO: (VECTOR_WEIGHT_HOWTO, BM25_WEIGHT_HOWTO),
+        QueryIntent.NAVIGATIONAL: (settings.hybrid_vector_weight_navigational, settings.hybrid_bm25_weight_navigational),
+        QueryIntent.EXPLORATORY: (settings.hybrid_vector_weight_exploratory, settings.hybrid_bm25_weight_exploratory),
+        QueryIntent.FACTUAL: (settings.hybrid_vector_weight_factual, settings.hybrid_bm25_weight_factual),
+        QueryIntent.HOWTO: (settings.hybrid_vector_weight_howto, settings.hybrid_bm25_weight_howto),
     }
 
-    vector_weight, bm25_weight = weights.get(query_intent, (VECTOR_WEIGHT, BM25_WEIGHT))
+    vector_weight, bm25_weight = weights.get(query_intent, (settings.hybrid_vector_weight, settings.hybrid_bm25_weight))
 
     # Нормализуем веса (сумма должна быть ~1.0)
     total = vector_weight + bm25_weight
@@ -126,10 +114,9 @@ def get_adaptive_weights(query_intent: QueryIntent) -> Tuple[float, float]:
 def _load_documents_from_qdrant(collection_name: str, limit: int) -> dict:
     """Загружает документы из Qdrant."""
     # Ограничиваем для предотвращения OOM
-    MAX_DOCS = int(os.getenv("BM25_MAX_DOCS", "50000"))
-    actual_limit = min(limit, MAX_DOCS)
+    actual_limit = min(limit, settings.bm25_max_docs)
 
-    target_collection = collection_name or os.getenv("QDRANT_COLLECTION", "confluence_chunks")
+    target_collection = collection_name or settings.qdrant_collection
     logger.info(f"Загрузка документов для BM25 из коллекции: {target_collection} (limit={actual_limit})")
 
     all_data = get_all_points(limit=actual_limit)
@@ -188,8 +175,8 @@ def init_bm25_retriever(collection_name: str = None) -> bool:
     """
     global bm25_index, bm25_corpus, bm25_nodes
 
-    if not ENABLE_HYBRID_SEARCH:
-        logger.info("Hybrid Search отключен (ENABLE_HYBRID_SEARCH=false)")
+    if not settings.enable_hybrid_search:
+        logger.info("Hybrid Search отключен (settings.enable_hybrid_search=false)")
         return False
 
     if bm25_index is not None:
@@ -221,7 +208,7 @@ def init_bm25_retriever(collection_name: str = None) -> bool:
 def reciprocal_rank_fusion(
     vector_results: List[Dict[str, Any]],
     bm25_results: List[Dict[str, Any]],
-    k: int = RRF_K,
+    k: int = None,
     vector_weight: float = None,
     bm25_weight: float = None
 ) -> List[Dict[str, Any]]:
@@ -229,25 +216,17 @@ def reciprocal_rank_fusion(
     Объединяет результаты векторного и BM25 поиска через Reciprocal Rank Fusion (RRF).
 
     RRF Score = SUM(weight * (1 / (k + rank))) для каждого результата
-
-    Args:
-        vector_results: Результаты векторного поиска (с полем 'distance')
-        bm25_results: Результаты BM25 поиска
-        k: Параметр RRF (стандарт: 60)
-        vector_weight: Вес векторного поиска (по умолчанию из ENV)
-        bm25_weight: Вес BM25 поиска (по умолчанию из ENV)
-
-    Returns:
-        Объединенный и отсортированный список результатов
     """
     if not vector_results and not bm25_results:
         return []
 
-    # Используем переданные веса или значения по умолчанию
+    # Используем переданные веса или значения из настроек
+    if k is None:
+        k = settings.hybrid_rrf_k
     if vector_weight is None:
-        vector_weight = VECTOR_WEIGHT
+        vector_weight = settings.hybrid_vector_weight
     if bm25_weight is None:
-        bm25_weight = BM25_WEIGHT
+        bm25_weight = settings.hybrid_bm25_weight
 
     # Словарь для накопления RRF scores
     rrf_scores = defaultdict(lambda: {
@@ -321,9 +300,23 @@ def hybrid_search(
     limit: int = 20
 ) -> List[Dict[str, Any]]:
     """
-    Выполняет Hybrid Search: объединяет Vector + BM25 результаты через RRF.
+    Выполняет Hybrid Search: объединяет Vector + BM25 результаты через RRF. (Sync wrapper)
     """
-    if not ENABLE_HYBRID_SEARCH:
+    # Для обратной совместимости
+    return asyncio.run(hybrid_search_async(query, collection_name, vector_results, space_filter, limit))
+
+
+async def hybrid_search_async(
+    query: str,
+    collection_name: str,
+    vector_results: List[Dict[str, Any]],
+    space_filter: Optional[str] = None,
+    limit: int = 20
+) -> List[Dict[str, Any]]:
+    """
+    Выполняет Hybrid Search: объединяет Vector + BM25 результаты через RRF. (Async)
+    """
+    if not settings.enable_hybrid_search:
         return vector_results[:limit]
 
     # Определяем интент запроса для весов
@@ -337,48 +330,49 @@ def hybrid_search(
     try:
         # Инициализируем BM25 если еще нет (ленивая загрузка)
         if bm25_index is None:
+            # BM25 init is sync and fast if using cached points, but slow if loading from DB.
+            # Assuming it's already initialized or fast enough.
+            # Ideally init_bm25_retriever should be run at startup.
             success = init_bm25_retriever(collection_name)
             if not success:
                 return vector_results[:limit]
 
         with tracer.start_as_current_span("hybrid_search_bm25"):
-            # 1. BM25 Поиск
-            tokenized_query = simple_tokenize(query)
+            # 1. BM25 Поиск (CPU bound, run in executor)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
 
-            # Получаем топ-N документов по BM25
-            # Берем больше кандидатов (limit * 2) для лучшего пересечения
-            bm25_limit = limit * 3
+            def _run_bm25():
+                tokenized_query = simple_tokenize(query)
+                bm25_limit = limit * 3
+                with timed_operation(BM25_LATENCY):
+                    doc_scores = bm25_index.get_scores(tokenized_query)
+                top_indices = sorted(range(len(doc_scores)), key=lambda i: doc_scores[i], reverse=True)[:bm25_limit]
 
-            # get_top_n возвращает список документов, но нам нужны индексы или scores
-            # rank_bm25 не имеет метода get_top_n_with_scores, делаем сами
-            with timed_operation(BM25_LATENCY):
-                doc_scores = bm25_index.get_scores(tokenized_query)
+                res = []
+                for idx in top_indices:
+                    score = doc_scores[idx]
+                    if score <= 0: continue
+                    point = bm25_nodes[idx]
+                    res.append({
+                        'id': point['id'],
+                        'score': score,
+                        'payload': point['payload'],
+                        'text': point['text']
+                    })
+                return res
 
-            # Сортируем индексы по убыванию score
-            top_indices = sorted(range(len(doc_scores)), key=lambda i: doc_scores[i], reverse=True)[:bm25_limit]
+            bm25_results = await loop.run_in_executor(None, _run_bm25)
 
-            bm25_results = []
-            for idx in top_indices:
-                score = doc_scores[idx]
-                if score <= 0:
-                    continue
-
-                point = bm25_nodes[idx]
-                # Преобразуем point в формат результата (как vector_results)
-                result = {
-                    'id': point['id'],
-                    'score': score,  # BM25 score
-                    'payload': point['payload'],
-                    'text': point['text']
-                }
-                bm25_results.append(result)
-
-            # 2. Объединение через RRF
+            # 2. Объединение через RRF (CPU bound, fast enough to run in thread or sync)
             with timed_operation(RRF_LATENCY):
                 merged_results = reciprocal_rank_fusion(
                     vector_results,
                     bm25_results,
-                    k=RRF_K,
+                    k=settings.hybrid_rrf_k,
                     vector_weight=vector_weight,
                     bm25_weight=bm25_weight
                 )
@@ -395,15 +389,12 @@ def hybrid_search(
 def get_hybrid_search_stats() -> Dict[str, Any]:
     """
     Возвращает статистику Hybrid Search.
-
-    Returns:
-        Словарь со статистикой
     """
     return {
-        'enabled': ENABLE_HYBRID_SEARCH,
-        'vector_weight': VECTOR_WEIGHT,
-        'bm25_weight': BM25_WEIGHT,
-        'rrf_k': RRF_K,
+        'enabled': settings.enable_hybrid_search,
+        'vector_weight': settings.hybrid_vector_weight,
+        'bm25_weight': settings.hybrid_bm25_weight,
+        'rrf_k': settings.hybrid_rrf_k,
         'bm25_initialized': bm25_index is not None,
         'bm25_documents': len(bm25_corpus) if bm25_corpus else 0
     }

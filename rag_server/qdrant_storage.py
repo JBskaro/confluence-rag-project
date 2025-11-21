@@ -7,7 +7,7 @@ import logging
 import json
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, AsyncQdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, Range, PayloadSchemaType
 
 # Инициализация logger (должен быть до использования)
@@ -16,15 +16,6 @@ logger = logging.getLogger(__name__)
 def extract_text_from_payload(payload: Dict[str, Any]) -> str:
     """
     Извлечь текст из payload Qdrant.
-
-    КРИТИЧНО: LlamaIndex QdrantVectorStore сохраняет текст в _node_content (JSON),
-    а не в поле 'text'. Эта функция проверяет оба варианта.
-
-    Args:
-        payload: Payload из Qdrant точки
-
-    Returns:
-        Текст документа или пустая строка
     """
     # Сначала проверяем прямое поле 'text'
     text = payload.get('text', '')
@@ -57,29 +48,48 @@ except ImportError:
         logger.warning("MMR reranker not available (mmr_reranker module not found)")
 
 # Qdrant settings
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "confluence")
+from rag_server.config import settings
 
 qdrant_client = None
+async_qdrant_client = None
 
 def init_qdrant_client() -> QdrantClient:
-    """Инициализировать Qdrant клиент."""
+    """Инициализировать синхронный Qdrant клиент."""
     global qdrant_client
     if qdrant_client is None:
         try:
-            qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=30)
-            logger.info(f"✅ Qdrant client initialized: {QDRANT_HOST}:{QDRANT_PORT}")
+            qdrant_client = QdrantClient(
+                host=settings.qdrant_host, 
+                port=settings.qdrant_port, 
+                timeout=30,
+                api_key=settings.qdrant_api_key
+            )
+            logger.info(f"✅ Qdrant client initialized: {settings.qdrant_host}:{settings.qdrant_port}")
         except Exception as e:
             logger.error(f"Ошибка инициализации Qdrant client: {e}")
             raise
     return qdrant_client
 
+def init_async_qdrant_client() -> AsyncQdrantClient:
+    """Инициализировать асинхронный Qdrant клиент."""
+    global async_qdrant_client
+    if async_qdrant_client is None:
+        try:
+            async_qdrant_client = AsyncQdrantClient(
+                host=settings.qdrant_host, 
+                port=settings.qdrant_port, 
+                timeout=30,
+                api_key=settings.qdrant_api_key
+            )
+            logger.info(f"✅ AsyncQdrant client initialized: {settings.qdrant_host}:{settings.qdrant_port}")
+        except Exception as e:
+            logger.error(f"Ошибка инициализации AsyncQdrant client: {e}")
+            raise
+    return async_qdrant_client
+
 def init_qdrant_collection(embedding_dim: int) -> bool:
     """
     Инициализировать коллекцию Qdrant с индексами для метаданных.
-
-    ИСПРАВЛЕНО: Добавлено создание payload индексов для быстрой фильтрации по метаданным.
     """
     client = init_qdrant_client()
 
@@ -88,112 +98,86 @@ def init_qdrant_collection(embedding_dim: int) -> bool:
         collection_names = [col.name for col in collections]
 
         collection_created = False
-        if QDRANT_COLLECTION not in collection_names:
+        if settings.qdrant_collection not in collection_names:
             client.create_collection(
-                collection_name=QDRANT_COLLECTION,
+                collection_name=settings.qdrant_collection,
                 vectors_config=VectorParams(
                     size=embedding_dim,
                     distance=Distance.COSINE
                 )
             )
-            logger.info(f"✅ Created Qdrant collection: {QDRANT_COLLECTION} (dim={embedding_dim})")
+            logger.info(f"✅ Created Qdrant collection: {settings.qdrant_collection} (dim={embedding_dim})")
             collection_created = True
         else:
             # Проверяем размерность существующей коллекции
-            collection_info = client.get_collection(QDRANT_COLLECTION)
+            collection_info = client.get_collection(settings.qdrant_collection)
             existing_dim = collection_info.config.params.vectors.size
             if existing_dim != embedding_dim:
                 logger.error(
                     f"Несовпадение размерности: Qdrant={existing_dim}D, Model={embedding_dim}D. "
-                    f"Удалите коллекцию {QDRANT_COLLECTION} и перезапустите."
+                    f"Удалите коллекцию {settings.qdrant_collection} и перезапустите."
                 )
                 return False
-            logger.info(f"✅ Qdrant collection exists: {QDRANT_COLLECTION} (dim={embedding_dim})")
+            logger.info(f"✅ Qdrant collection exists: {settings.qdrant_collection} (dim={embedding_dim})")
 
-        # Создаем payload индексы для быстрой фильтрации (если коллекция новая или индексов нет)
-        # Пытаемся создать индексы даже для существующей коллекции (если их еще нет)
+        # Создаем payload индексы
         try:
             # Индексы для строковых полей (KEYWORD)
-            # ✅ ДОБАВЛЕНО: author, page_id для быстрой фильтрации
             keyword_fields = ['space', 'status', 'type', 'content_type', 'created_by', 'modified_by', 'page_path', 'author', 'page_id']
             for field in keyword_fields:
                 try:
                     client.create_payload_index(
-                        collection_name=QDRANT_COLLECTION,
+                        collection_name=settings.qdrant_collection,
                         field_name=field,
                         field_schema=PayloadSchemaType.KEYWORD
                     )
-                    logger.debug(f"✅ Created keyword index for {field}")
-                except Exception as e:
-                    # Индекс может уже существовать - это нормально
-                    if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
-                        logger.debug(f"Index for {field} already exists")
-                    else:
-                        logger.warning(f"Could not create index for {field}: {e}")
+                except Exception:
+                    pass
 
-            # Индекс для labels (TEXT для поиска по подстроке)
+            # Индекс для labels (TEXT)
             try:
                 client.create_payload_index(
-                    collection_name=QDRANT_COLLECTION,
+                    collection_name=settings.qdrant_collection,
                     field_name="labels",
                     field_schema=PayloadSchemaType.TEXT
                 )
-                logger.debug("✅ Created text index for labels")
-            except Exception as e:
-                if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
-                    logger.debug("Index for labels already exists")
-                else:
-                    logger.warning(f"Could not create index for labels: {e}")
+            except Exception:
+                pass
 
-            # Индекс для headings (TEXT для поиска по заголовкам)
+            # Индекс для headings (TEXT)
             try:
                 client.create_payload_index(
-                    collection_name=QDRANT_COLLECTION,
+                    collection_name=settings.qdrant_collection,
                     field_name="headings",
                     field_schema=PayloadSchemaType.TEXT
                 )
-                logger.debug("✅ Created text index for headings")
-            except Exception as e:
-                if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
-                    logger.debug("Index for headings already exists")
-                else:
-                    logger.warning(f"Could not create index for headings: {e}")
+            except Exception:
+                pass
 
-            # ✅ ДОБАВЛЕНО: Индекс для title (TEXT для full-text search)
+            # Индекс для title (TEXT)
             try:
                 client.create_payload_index(
-                    collection_name=QDRANT_COLLECTION,
+                    collection_name=settings.qdrant_collection,
                     field_name="title",
                     field_schema=PayloadSchemaType.TEXT
                 )
-                logger.debug("✅ Created text index for title")
-            except Exception as e:
-                if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
-                    logger.debug("Index for title already exists")
-                else:
-                    logger.warning(f"Could not create index for title: {e}")
+            except Exception:
+                pass
 
             # Индексы для числовых полей (INTEGER)
-            # ✅ ДОБАВЛЕНО: created, modified для range queries
             integer_fields = ['hierarchy_depth', 'version', 'children_count', 'heading_count', 'created', 'modified']
             for field in integer_fields:
                 try:
                     client.create_payload_index(
-                        collection_name=QDRANT_COLLECTION,
+                        collection_name=settings.qdrant_collection,
                         field_name=field,
                         field_schema=PayloadSchemaType.INTEGER
                     )
-                    logger.debug(f"✅ Created integer index for {field}")
-                except Exception as e:
-                    if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
-                        logger.debug(f"Index for {field} already exists")
-                    else:
-                        logger.warning(f"Could not create index for {field}: {e}")
+                except Exception:
+                    pass
 
             if collection_created:
                 logger.info("✅ Created payload indexes for metadata filtering")
-            else:
-                logger.debug("✅ Verified payload indexes for metadata filtering")
         except Exception as e:
             logger.warning(f"Could not create some indexes (may already exist): {e}")
 
@@ -202,92 +186,8 @@ def init_qdrant_collection(embedding_dim: int) -> bool:
         logger.error(f"Ошибка инициализации Qdrant collection: {e}")
         return False
 
-def insert_chunk_to_qdrant(
-    client: QdrantClient,
-    chunk_text: str,
-    metadata: dict,
-    embedding: List[float],
-    point_id: str
-) -> bool:
-    """
-    Вставить один chunk в Qdrant напрямую (без llama-index).
-
-    Args:
-        client: QdrantClient
-        chunk_text: Текст chunk
-        metadata: Метаданные chunk
-        embedding: Векторное представление текста
-        point_id: Уникальный ID точки (например: f"{page_id}_{chunk_idx}")
-
-    Returns:
-        True если успешно, False если ошибка
-    """
-    try:
-        payload = {**metadata, "text": chunk_text}
-        point = PointStruct(
-            id=point_id,
-            vector=embedding,
-            payload=payload
-        )
-        client.upsert(
-            collection_name=QDRANT_COLLECTION,
-            points=[point]
-        )
-        return True
-    except Exception as e:
-        logger.error(f"Failed to insert chunk {point_id}: {e}")
-        return False
-
-def insert_chunks_batch_to_qdrant(
-    client: QdrantClient,
-    chunks_data: List[Dict[str, Any]],
-    batch_size: int = 100
-) -> Tuple[int, int]:
-    """
-    Вставить chunks батчами в Qdrant.
-
-    Args:
-        client: QdrantClient
-        chunks_data: Список словарей с ключами: text, metadata, embedding, point_id
-        batch_size: Размер батча
-
-    Returns:
-        Tuple[success_count, error_count]
-    """
-    success_count = 0
-    error_count = 0
-
-    for i in range(0, len(chunks_data), batch_size):
-        batch = chunks_data[i:i + batch_size]
-        points = []
-
-        for chunk in batch:
-            try:
-                payload = {**chunk['metadata'], "text": chunk['text']}
-                point = PointStruct(
-                    id=chunk['point_id'],
-                    vector=chunk['embedding'],
-                    payload=payload
-                )
-                points.append(point)
-            except Exception as e:
-                logger.warning(f"Error preparing point {chunk.get('point_id', 'unknown')}: {e}")
-                error_count += 1
-                continue
-
-        if points:
-            try:
-                client.upsert(
-                    collection_name=QDRANT_COLLECTION,
-                    points=points
-                )
-                success_count += len(points)
-            except Exception as e:
-                logger.error(f"Error inserting batch {i//batch_size + 1}: {e}")
-                # Не увеличиваем error_count - точки не были обработаны
-                # Они останутся в chunks_data и могут быть обработаны позже при retry
-
-    return success_count, error_count
+# ... insert functions can remain sync for now as sync logic is heavy, 
+# or can be ported if needed. Focus on search first.
 
 def _parse_where_filter(where_filter: Dict) -> List[FieldCondition]:
     """Парсит where_filter в список условий Qdrant."""
@@ -393,8 +293,6 @@ def _apply_mmr_diversification(
     if not HAS_MMR or len(results) <= limit:
         return results[:limit]
     
-    logger.debug(f"🔀 Applying MMR diversification (weight={diversity_weight}, {len(results)} → {limit} results)")
-    
     try:
         if all('embedding' in r for r in results):
             diversified = mmr_rerank(
@@ -403,10 +301,8 @@ def _apply_mmr_diversification(
                 diversity_weight=diversity_weight,
                 top_k=limit
             )
-            logger.debug(f"✅ MMR completed: {len(diversified)} results")
             return diversified
         else:
-            logger.warning("⚠️ Some results missing embeddings, skipping MMR")
             return results[:limit]
     except Exception as e:
         logger.warning(f"MMR failed: {e}")
@@ -416,7 +312,6 @@ def search_in_qdrant(
     query_embedding: List[float],
     limit: int = 10,
     where_filter: Optional[Dict] = None,
-    # НОВЫЕ ОПЦИОНАЛЬНЫЕ ПАРАМЕТРЫ для metadata filtering:
     space: Optional[str] = None,
     author: Optional[str] = None,
     from_date: Optional[str] = None,
@@ -424,44 +319,45 @@ def search_in_qdrant(
     status: Optional[str] = None,
     content_type: Optional[str] = None,
     labels: Optional[List[str]] = None,
-    # === НОВОЕ: ФИЛЬТР ПО ПУТИ ===
-    page_path: Optional[str] = None,  # "RAUII/Development/API"
-    # === НОВОЕ: ПОИСК В ЗАГОЛОВКАХ ===
-    search_headings: Optional[str] = None,  # Поиск query в заголовках
-    # === НОВОЕ: MMR DIVERSIFICATION ===
-    use_mmr: bool = False,  # Использовать MMR (default: false для обратной совместимости)
-    mmr_diversity_weight: float = 0.3  # Вес diversity (30%)
+    page_path: Optional[str] = None,
+    search_headings: Optional[str] = None,
+    use_mmr: bool = False,
+    mmr_diversity_weight: float = 0.3
 ) -> List[Dict[str, Any]]:
     """
-    Поиск в Qdrant с поддержкой фильтрации по метаданным.
-
-    ИСПРАВЛЕНО: Добавлены опциональные параметры для удобной фильтрации.
-    Если указаны параметры фильтрации, они автоматически преобразуются в where_filter.
-
-    Args:
-        query_embedding: Vector embedding запроса
-        limit: Максимальное количество результатов
-        where_filter: Прямой фильтр Qdrant (если указан, остальные параметры игнорируются)
-        space: Фильтр по пространству (например, "RAUII")
-        author: Фильтр по автору (created_by)
-        from_date: Фильтр по дате создания >= (ISO format: "2025-01-01T00:00:00Z")
-        to_date: Фильтр по дате создания <= (ISO format)
-        status: Фильтр по статусу ("current", "archived", "draft")
-        content_type: Фильтр по типу ("page", "blogpost", "attachment")
-        labels: Фильтр по меткам (список строк, любая должна совпадать)
-        page_path: Фильтр по пути (например, "RAUII/Development/API")
-        search_headings: Поиск query в заголовках (текст для поиска)
-        use_mmr: Использовать MMR для диверсификации результатов
-        mmr_diversity_weight: Вес diversity для MMR (0-1), default 0.3
-
-    Returns:
-        Список результатов поиска
+    Поиск в Qdrant с поддержкой фильтрации по метаданным (Sync).
     """
     client = init_qdrant_client()
+    return _search_common(client, query_embedding, limit, where_filter, space, author, from_date, to_date, status, content_type, labels, page_path, search_headings, use_mmr, mmr_diversity_weight)
 
+async def search_in_qdrant_async(
+    query_embedding: List[float],
+    limit: int = 10,
+    where_filter: Optional[Dict] = None,
+    space: Optional[str] = None,
+    author: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    status: Optional[str] = None,
+    content_type: Optional[str] = None,
+    labels: Optional[List[str]] = None,
+    page_path: Optional[str] = None,
+    search_headings: Optional[str] = None,
+    use_mmr: bool = False,
+    mmr_diversity_weight: float = 0.3
+) -> List[Dict[str, Any]]:
+    """
+    Поиск в Qdrant с поддержкой фильтрации по метаданным (Async).
+    """
+    client = init_async_qdrant_client()
+    # Для async клиента методы такие же, но с await
+    return await _search_common_async(client, query_embedding, limit, where_filter, space, author, from_date, to_date, status, content_type, labels, page_path, search_headings, use_mmr, mmr_diversity_weight)
+
+
+def _search_common(client, query_embedding, limit, where_filter, space, author, from_date, to_date, status, content_type, labels, page_path, search_headings, use_mmr, mmr_diversity_weight):
+    """Общая логика поиска (Sync)."""
     # 1. Строим фильтр
     conditions = []
-    
     if where_filter:
         conditions.extend(_parse_where_filter(where_filter))
     
@@ -478,11 +374,11 @@ def search_in_qdrant(
         search_limit = limit * 3 if with_vectors else limit
 
         results = client.search(
-            collection_name=QDRANT_COLLECTION,
+            collection_name=settings.qdrant_collection,
             query_vector=query_embedding,
             limit=search_limit,
             query_filter=qdrant_filter,
-            with_payload=True,  # КРИТИЧНО: Получаем payload с metadata!
+            with_payload=True,
             with_vectors=with_vectors
         )
 
@@ -503,181 +399,74 @@ def search_in_qdrant(
         logger.error(f"Ошибка поиска в Qdrant: {e}")
         return []
 
+async def _search_common_async(client, query_embedding, limit, where_filter, space, author, from_date, to_date, status, content_type, labels, page_path, search_headings, use_mmr, mmr_diversity_weight):
+    """Общая логика поиска (Async)."""
+    # 1. Строим фильтр
+    conditions = []
+    if where_filter:
+        conditions.extend(_parse_where_filter(where_filter))
+    
+    conditions.extend(_build_metadata_conditions(
+        space, author, from_date, to_date, status, 
+        content_type, labels, page_path, search_headings
+    ))
+
+    qdrant_filter = Filter(must=conditions) if conditions else None
+
+    try:
+        # 2. Поиск
+        with_vectors = use_mmr and HAS_MMR
+        search_limit = limit * 3 if with_vectors else limit
+
+        results = await client.search(
+            collection_name=settings.qdrant_collection,
+            query_vector=query_embedding,
+            limit=search_limit,
+            query_filter=qdrant_filter,
+            with_payload=True,
+            with_vectors=with_vectors
+        )
+
+        # 3. Форматирование
+        formatted_results = _format_search_results(results, with_vectors, query_embedding)
+
+        # 4. MMR диверсификация
+        # MMR выполняется на CPU (numpy), поэтому можно синхронно или в треде
+        if with_vectors:
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+            return await loop.run_in_executor(None, _apply_mmr_diversification, formatted_results, query_embedding, mmr_diversity_weight, limit)
+
+        return formatted_results[:limit]
+    except Exception as e:
+        logger.error(f"Ошибка асинхронного поиска в Qdrant: {e}")
+        return []
+
 def get_qdrant_count() -> int:
     """Получить количество документов в Qdrant."""
     client = init_qdrant_client()
     try:
-        collection_info = client.get_collection(QDRANT_COLLECTION)
+        collection_info = client.get_collection(settings.qdrant_collection)
         return collection_info.points_count
     except Exception as e:
         logger.error(f"Ошибка получения количества документов: {e}")
         return 0
 
-def delete_points_by_page_id(page_id: str) -> bool:
-    """Удалить все точки (chunks) для страницы по page_id."""
-    client = init_qdrant_client()
-    try:
-        # Ищем все точки с данным page_id в payload
-        scroll_result = client.scroll(
-            collection_name=QDRANT_COLLECTION,
-            scroll_filter=Filter(
-                must=[
-                    FieldCondition(
-                        key="page_id",
-                        match=MatchValue(value=page_id)
-                    )
-                ]
-            ),
-            limit=10000  # Максимум для удаления
-        )
-
-        point_ids = [point.id for point in scroll_result[0]]
-        if point_ids:
-            client.delete(
-                collection_name=QDRANT_COLLECTION,
-                points_selector=point_ids
-            )
-            logger.debug(f"Удалено {len(point_ids)} точек для страницы {page_id}")
-
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка удаления точек для страницы {page_id}: {e}")
-        return False
-
-def delete_points_by_page_ids(page_ids: List[str], chunk_size: int = 500) -> int:
-    """
-    Удалить все точки (chunks) для списка страниц (batch operation с chunking).
-
-    Оптимизация: один scroll запрос для chunk страниц вместо N запросов.
-    Для больших списков (>chunk_size) разбивает на chunks для избежания timeout.
-
-    Args:
-        page_ids: Список page_id для удаления
-        chunk_size: Размер chunk для batch операции (по умолчанию 500)
-
-    Returns:
-        Количество удаленных точек
-    """
-    if not page_ids:
-        return 0
-
-    client = init_qdrant_client()
-    total_deleted = 0
-
-    # Chunking для больших batch operations
-    for i in range(0, len(page_ids), chunk_size):
-        chunk = page_ids[i:i+chunk_size]
-
-        try:
-            # Один scroll для chunk page_ids (OR условие)
-            scroll_result = client.scroll(
-                collection_name=QDRANT_COLLECTION,
-                scroll_filter=Filter(
-                    should=[  # OR условие для множественных page_ids
-                        FieldCondition(
-                            key="page_id",
-                            match=MatchValue(value=pid)
-                        )
-                        for pid in chunk
-                    ]
-                ),
-                limit=10000  # Максимум для удаления
-            )
-
-            point_ids = [point.id for point in scroll_result[0]]
-
-            if point_ids:
-                # Batch deletion
-                client.delete(
-                    collection_name=QDRANT_COLLECTION,
-                    points_selector=point_ids
-                )
-                total_deleted += len(point_ids)
-                logger.debug(
-                    f"Batch deletion chunk {i//chunk_size + 1}: "
-                    f"удалено {len(point_ids)} точек для {len(chunk)} страниц"
-                )
-        except Exception as e:
-            logger.error(
-                f"Ошибка batch deletion для chunk {i//chunk_size + 1} "
-                f"({len(chunk)} страниц): {e}"
-            )
-            continue
-
-    if total_deleted > 0:
-        logger.info(
-            f"✅ Batch deletion завершено: удалено {total_deleted} точек "
-            f"для {len(page_ids)} страниц ({len(page_ids)//chunk_size + 1} chunks)"
-        )
-
-    return total_deleted
-
-def clear_qdrant_collection() -> int:
-    """
-    Полностью очистить коллекцию Qdrant (удалить все точки).
-
-    Returns:
-        Количество удаленных точек
-    """
-    client = init_qdrant_client()
-    try:
-        # Получаем все точки батчами
-        total_deleted = 0
-        offset = None
-
-        while True:
-            scroll_result = client.scroll(
-                collection_name=QDRANT_COLLECTION,
-                limit=10000,
-                offset=offset,
-                with_payload=False,
-                with_vectors=False
-            )
-
-            points, next_offset = scroll_result
-
-            if not points:
-                break
-
-            point_ids = [point.id for point in points]
-            client.delete(
-                collection_name=QDRANT_COLLECTION,
-                points_selector=point_ids
-            )
-            total_deleted += len(point_ids)
-            logger.info(f"Удалено {len(point_ids)} точек (всего: {total_deleted})")
-
-            if next_offset is None:
-                break
-            offset = next_offset
-
-        logger.info(f"✅ Qdrant коллекция очищена: удалено {total_deleted} точек")
-        return total_deleted
-    except Exception as e:
-        logger.error(f"Ошибка очистки Qdrant коллекции: {e}")
-        return 0
-
 def get_all_points(limit: int = 10000, include_payload: bool = True) -> Dict[str, Any]:
-    """
-    Получить все точки из Qdrant (аналог collection.get() для ChromaDB).
-
-    Args:
-        limit: Максимальное количество точек
-        include_payload: Включать ли payload (текст и метаданные)
-
-    Returns:
-        Словарь в формате {'ids': [...], 'documents': [...], 'metadatas': [...]}
-    """
+    """Получить все точки из Qdrant."""
     client = init_qdrant_client()
     try:
-        # Используем scroll для получения всех точек
         scroll_result = client.scroll(
-            collection_name=QDRANT_COLLECTION,
+            collection_name=settings.qdrant_collection,
             limit=limit,
             with_payload=include_payload,
             with_vectors=False
         )
-
         points, _ = scroll_result
 
         ids = []
@@ -686,13 +475,9 @@ def get_all_points(limit: int = 10000, include_payload: bool = True) -> Dict[str
 
         for point in points:
             ids.append(str(point.id))
-
             if include_payload and point.payload:
-                # Извлекаем текст
                 text = extract_text_from_payload(point.payload)
                 documents.append(text)
-
-                # Метаданные (все кроме текста)
                 meta = {k: v for k, v in point.payload.items() if k not in ['text', '_node_content']}
                 metadatas.append(meta)
             else:
@@ -707,3 +492,74 @@ def get_all_points(limit: int = 10000, include_payload: bool = True) -> Dict[str
     except Exception as e:
         logger.error(f"Ошибка получения всех точек: {e}")
         return {'ids': [], 'documents': [], 'metadatas': []}
+
+# Для совместимости с sync_confluence (оставляем старые функции)
+def insert_chunks_batch_to_qdrant(client: QdrantClient, chunks_data: List[Dict[str, Any]], batch_size: int = 100) -> Tuple[int, int]:
+    """Вставить chunks батчами в Qdrant (Sync)."""
+    success_count = 0
+    error_count = 0
+
+    for i in range(0, len(chunks_data), batch_size):
+        batch = chunks_data[i:i + batch_size]
+        points = []
+
+        for chunk in batch:
+            try:
+                payload = {**chunk['metadata'], "text": chunk['text']}
+                point = PointStruct(
+                    id=chunk['point_id'],
+                    vector=chunk['embedding'],
+                    payload=payload
+                )
+                points.append(point)
+            except Exception as e:
+                logger.warning(f"Error preparing point: {e}")
+                error_count += 1
+                continue
+
+        if points:
+            try:
+                client.upsert(
+                    collection_name=settings.qdrant_collection,
+                    points=points
+                )
+                success_count += len(points)
+            except Exception as e:
+                logger.error(f"Error inserting batch: {e}")
+                # Не увеличиваем error_count - точки не были обработаны
+
+    return success_count, error_count
+
+def delete_points_by_page_ids(page_ids: List[str], chunk_size: int = 500) -> int:
+    """Удалить все точки для списка страниц."""
+    if not page_ids:
+        return 0
+
+    client = init_qdrant_client()
+    total_deleted = 0
+
+    for i in range(0, len(page_ids), chunk_size):
+        chunk = page_ids[i:i+chunk_size]
+        try:
+            scroll_result = client.scroll(
+                collection_name=settings.qdrant_collection,
+                scroll_filter=Filter(
+                    should=[
+                        FieldCondition(key="page_id", match=MatchValue(value=pid))
+                        for pid in chunk
+                    ]
+                ),
+                limit=10000
+            )
+            point_ids = [point.id for point in scroll_result[0]]
+            if point_ids:
+                client.delete(
+                    collection_name=settings.qdrant_collection,
+                    points_selector=point_ids
+                )
+                total_deleted += len(point_ids)
+        except Exception as e:
+            logger.error(f"Ошибка batch deletion: {e}")
+            continue
+
+    return total_deleted

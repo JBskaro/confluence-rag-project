@@ -25,15 +25,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 
-# Qdrant configuration
-QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "confluence")
+# Pydantic config
+from rag_server.config import settings
+
 # Импортируем унифицированный модуль embeddings
 from embeddings import (
-    get_embedding_dimension,
-    EMBED_MODEL,
-    USE_OLLAMA
+    get_embedding_dimension
 )
 
 # Импортируем новые модули для продвинутого поиска
@@ -64,11 +61,8 @@ def init_reranker():
             start_time = time.time()
             from sentence_transformers import CrossEncoder
 
-            # Получаем модель из ENV или используем дефолт (Russian MS-MARCO)
-            model_name = os.getenv(
-                'RE_RANKER_MODEL',
-                'DiTy/cross-encoder-russian-msmarco'  # По умолчанию Russian MS-MARCO
-            )
+            # Получаем модель из settings
+            model_name = settings.reranker_model
 
             logger.info(f"Инициализация CrossEncoder для reranking...")
             logger.info(f"  Модель: {model_name}")
@@ -502,7 +496,7 @@ def expand_context_window(result: dict, window_size: int = 1) -> dict:
                 ]
             },
             limit=100,
-            collection=QDRANT_COLLECTION
+            collection=settings.qdrant_collection
         )
         neighbors = {
             'documents': [r.get('text', '') for r in neighbors_raw],
@@ -1317,7 +1311,7 @@ def init_rag() -> QdrantClient:
         Exception: Если не удалось инициализировать компоненты
     """
     try:
-        logger.info(f"Инициализация Qdrant: {QDRANT_HOST}:{QDRANT_PORT}, collection={QDRANT_COLLECTION}")
+        logger.info(f"Инициализация Qdrant: {settings.qdrant_host}:{settings.qdrant_port}, collection={settings.qdrant_collection}")
 
         # Импортируем функции из qdrant_storage
         from qdrant_storage import init_qdrant_client, init_qdrant_collection
@@ -1331,7 +1325,7 @@ def init_rag() -> QdrantClient:
         # Инициализируем коллекцию (создает если не существует)
         success = init_qdrant_collection(embedding_dim)
         if not success:
-            raise ValueError(f"Failed to initialize Qdrant collection: {QDRANT_COLLECTION}")
+            raise ValueError(f"Failed to initialize Qdrant collection: {settings.qdrant_collection}")
 
         # Получаем количество документов
         from qdrant_storage import get_qdrant_count
@@ -1358,7 +1352,7 @@ logger.info(f"RAG система готова. Документов: {doc_count}
 # Инициализация BM25 retriever для Hybrid Search (ленивая инициализация)
 logger.info("Инициализация BM25 retriever для Hybrid Search...")
 # BM25 работает напрямую с Qdrant через qdrant_storage
-init_bm25_retriever(QDRANT_COLLECTION)
+init_bm25_retriever(settings.qdrant_collection)
 
 # Предзагрузка reranker модели при старте (чтобы первый запрос был быстрее)
 logger.info("Предзагрузка reranker модели при старте...")
@@ -1370,7 +1364,7 @@ except Exception as e:
 
 # Initialize SearchPipeline
 from search_pipeline import SearchPipeline, SearchParams
-search_pipeline = SearchPipeline(qdrant_client, QDRANT_COLLECTION, reranker)
+search_pipeline = SearchPipeline(qdrant_client, settings.qdrant_collection, reranker)
 logger.info("✅ SearchPipeline initialized")
 
 mcp = FastMCP("Confluence RAG")
@@ -1414,17 +1408,9 @@ def _validate_search_params(query: str, space: str, limit: int) -> tuple[bool, s
     return True, ""
 
 @mcp.tool()
-def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> str:
+async def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> str:
     """
     Выполняет семантический поиск по базе знаний Confluence.
-
-    Args:
-        query: Поисковый запрос
-        limit: Максимальное количество результатов (по умолчанию 5)
-        space: Опциональный фильтр по пространству (space key)
-
-    Returns:
-        Форматированный текст с результатами поиска
     """
     try:
         # 1. Извлечение space
@@ -1449,7 +1435,7 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
         if structure['is_structural_query']:
             logger.info(f"🔍 Структурный запрос обнаружен: {structure['parts']}")
             structural_results = cached_structural_search(
-                QDRANT_COLLECTION, structure, limit=limit * 10
+                settings.qdrant_collection, structure, limit=limit * 10
             )
             if structural_results and len(structural_results) >= limit:
                 # Применяем легкий reranking
@@ -1463,7 +1449,7 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
                 structural_results.sort(key=lambda x: x.get('boosted_score', x.get('rerank_score', 0)), reverse=True)
                 return format_search_results(structural_results[:limit], query, limit)
 
-        # 4. Standard Semantic Search Pipeline
+        # 4. Standard Semantic Search Pipeline (Async)
         expanded_queries = expand_query(query, space)
         params = SearchParams(
             query=query,
@@ -1473,7 +1459,7 @@ def confluence_semantic_search(query: str, limit: int = 5, space: str = "") -> s
             expanded_queries=expanded_queries[1:] if len(expanded_queries) > 1 else []
         )
 
-        results = search_pipeline.execute(params)
+        results = await search_pipeline.execute_async(params)
 
         if not results:
             return f"❌ Ничего не найдено по запросу: '{query}'"
@@ -1566,13 +1552,14 @@ def confluence_health() -> str:
             f"кэш: {rewrite_stats['cache_hit_rate']} ({rewrite_stats['cache_hits']}/{rewrite_stats['total_requests']})"
         )
 
-        mode_str = 'Ollama' if USE_OLLAMA else 'HuggingFace'
+        mode_str = 'Ollama' if settings.use_ollama else 'HuggingFace'
+        embed_model = settings.ollama_embedding_model if settings.use_ollama else settings.embed_model
 
         return (
             f"{status}\n"
             f"📊 Документов в индексе: {total_docs}\n"
-            f"🔧 Модель эмбеддингов: {EMBED_MODEL}\n"
-            f"💾 Qdrant: {QDRANT_HOST}:{QDRANT_PORT} (Collection: {QDRANT_COLLECTION})\n"
+            f"🔧 Модель эмбеддингов: {embed_model}\n"
+            f"💾 Qdrant: {settings.qdrant_host}:{settings.qdrant_port} (Collection: {settings.qdrant_collection})\n"
             f"🔄 Режим: {mode_str}\n"
             f"{rewrite_info}"
         )

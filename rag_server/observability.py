@@ -18,6 +18,9 @@ import logging
 import time
 from typing import Optional, Dict, Any
 
+# Pydantic config
+from rag_server.config import settings
+
 logger = logging.getLogger(__name__)
 
 # ============================================
@@ -204,16 +207,16 @@ def setup_observability(service_name: str = "confluence-rag") -> bool:
     # OPENTELEMETRY SETUP
     # ============================================
 
-    if HAS_OPENTELEMETRY:
+    if HAS_OPENTELEMETRY and settings.enable_tracing:
         try:
             # OTLP endpoint (Tempo)
-            otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4317")
+            otlp_endpoint = settings.jaeger_endpoint
 
             # Resource (service info)
             resource = Resource.create({
                 "service.name": service_name,
-                "service.version": os.getenv("APP_VERSION", "2.2.0"),
-                "deployment.environment": os.getenv("ENV", "production")
+                "service.version": settings.app_version,
+                "deployment.environment": settings.app_env
             })
 
             # Trace provider
@@ -228,7 +231,7 @@ def setup_observability(service_name: str = "confluence-rag") -> bool:
             # Metrics provider
             metric_reader = PeriodicExportingMetricReader(
                 OTLPMetricExporter(endpoint=otlp_endpoint, insecure=True),
-                export_interval_millis=15000  # 15 seconds
+                export_interval_millis=settings.otlp_export_interval_millis
             )
             meter_provider = MeterProvider(
                 resource=resource,
@@ -245,22 +248,23 @@ def setup_observability(service_name: str = "confluence-rag") -> bool:
             logger.warning(f"⚠️ OpenTelemetry setup failed: {e}")
             logger.warning("   Продолжаем без distributed tracing")
     else:
-        logger.info("ℹ️  OpenTelemetry не установлен, distributed tracing disabled")
+        logger.info("ℹ️  OpenTelemetry отключен или не установлен")
 
     # ============================================
     # PROMETHEUS SETUP
     # ============================================
 
-    if HAS_PROMETHEUS:
+    if HAS_PROMETHEUS and settings.enable_metrics:
         try:
-            prometheus_port = int(os.getenv("PROMETHEUS_PORT", "8001"))
+            prometheus_port = settings.metrics_port
             start_http_server(prometheus_port)
 
             # Set system info
             SYSTEM_INFO.info({
-                'version': os.getenv("APP_VERSION", "2.2.0"),
+                'version': settings.app_version,
                 'python_version': os.sys.version.split()[0],
-                'service': service_name
+                'service': service_name,
+                'environment': settings.app_env
             })
 
             logger.info(f"✅ Prometheus metrics доступны:")
@@ -271,7 +275,7 @@ def setup_observability(service_name: str = "confluence-rag") -> bool:
             logger.warning(f"⚠️ Prometheus setup failed: {e}")
             logger.warning("   Продолжаем без Prometheus metrics")
     else:
-        logger.info("ℹ️  Prometheus client не установлен, metrics disabled")
+        logger.info("ℹ️  Prometheus metrics отключены или клиент не установлен")
 
     return success
 
@@ -280,7 +284,7 @@ def setup_observability(service_name: str = "confluence-rag") -> bool:
 # TRACER & METER INSTANCES
 # ============================================
 
-if HAS_OPENTELEMETRY:
+if HAS_OPENTELEMETRY and settings.enable_tracing:
     tracer = trace.get_tracer(__name__)
     meter = metrics.get_meter(__name__)
 else:
@@ -329,4 +333,3 @@ class timed_operation:
             self.metric.observe(elapsed)
             if self.operation_name:
                 logger.debug(f"⏱️  {self.operation_name}: {elapsed:.3f}s")
-
