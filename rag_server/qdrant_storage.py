@@ -186,6 +186,22 @@ def init_qdrant_collection(embedding_dim: int) -> bool:
         logger.error(f"Ошибка инициализации Qdrant collection: {e}")
         return False
 
+def clear_qdrant_collection() -> int:
+    """
+    Полностью удалить коллекцию Qdrant.
+    Возвращает количество удаленных точек (примерно).
+    """
+    client = init_qdrant_client()
+    count = get_qdrant_count()
+    
+    try:
+        client.delete_collection(settings.qdrant_collection)
+        logger.info(f"✅ Коллекция {settings.qdrant_collection} удалена")
+        return count
+    except Exception as e:
+        logger.error(f"Ошибка удаления коллекции: {e}")
+        return 0
+
 # ... insert functions can remain sync for now as sync logic is heavy, 
 # or can be ported if needed. Focus on search first.
 
